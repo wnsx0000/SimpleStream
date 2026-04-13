@@ -490,6 +490,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         save_example_matrices: bool = False,
         save_raw_attentions: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        # Decode the video into chunk-level frame samples and fail fast if nothing is available.
         chunks, decode_backend = decode_video_to_chunks_qwen(
             video_path=video_path,
             chunk_duration=chunk_duration,
@@ -499,8 +500,10 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         if not chunks:
             raise ValueError(f"No chunks decoded from video: {video_path}")
 
+        # Flatten the chunked output into frame-level structures and collect analysis metadata.
         frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
 
+        # Initialize the metric store and the optional example payload scaffold.
         metrics: dict[str, Any] = {}
         example_payload: dict[str, Any] = {
             "video_path": video_path,
@@ -510,6 +513,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             "recent_chunk_ids": recent_chunk_ids,
         } if (save_example_matrices or save_raw_attentions) else {}
 
+        # If requested, compute SigLIP frame-text similarity and summarize it over recent frames.
         if "siglip" in similarity_backends:
             siglip_encoder = self.get_siglip_encoder()
             siglip_features = siglip_encoder.encode_frames(frames)
@@ -519,11 +523,13 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             if save_example_matrices:
                 example_payload["siglip_similarity_query"] = str(similarity_text or "")
 
+        # Initialize default attention metadata so the output schema stays stable even when skipped.
         attention_skipped_reason: str | None = None
         attention_frame_indices = list(range(len(frames)))
         attention_recent_indices: list[int] = recent_indices
         attention_sampling_strategy = "all_frames"
         if attention_modes:
+            # Compute vision embeddings once and choose the frame subset to use for attention analysis.
             cached_embeds, cached_grid_thw = self.encode_vision(frames)
             frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, self.merge_size)
             attention_frame_indices, attention_sampling_strategy = select_attention_frame_indices(
@@ -538,6 +544,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if frame_idx in attention_index_lookup
             ]
 
+            # Slice token features and frame metadata down to the selected attention frame subset.
             attention_embeds, attention_frame_token_counts = select_rows_by_frame_indices(
                 token_features=cached_embeds,
                 frame_token_counts=frame_token_counts,
@@ -547,6 +554,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             for row in frame_rows:
                 row["used_for_attention"] = bool(int(row["frame_index"]) in attention_index_lookup)
 
+            # Collect layer-wise prefill attention showing which frames the question tokens focus on.
             if "question_prefill" in attention_modes:
                 question_only_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,
@@ -582,6 +590,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if save_raw_attentions:
                     example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
 
+            # Collect frame-level decode attention for the first generated token and summarize it.
             if "first_token" in attention_modes:
                 full_prompt_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,
@@ -624,6 +633,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if save_raw_attentions:
                     example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
 
+        # Assemble the sample-level output record with frame metadata and computed metrics.
         record = {
             "video_path": video_path,
             "decode_backend": decode_backend,
@@ -637,6 +647,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             "attention_skipped_reason": attention_skipped_reason,
         }
 
+        # Attach metrics to the example payload only when example export is enabled.
         if save_example_matrices or save_raw_attentions:
             example_payload["metrics"] = metrics
         return record, (example_payload if save_example_matrices or save_raw_attentions else None)
