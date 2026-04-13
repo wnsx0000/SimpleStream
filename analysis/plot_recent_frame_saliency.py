@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+DISPLAY_LAYER_COUNT = 5
+
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -58,26 +60,75 @@ def metric_recent_sample_scores(records: list[dict[str, Any]], metric_name: str,
     return values
 
 
-def attention_layer_means(records: list[dict[str, Any]], metric_name: str, field: str) -> np.ndarray | None:
+def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_COUNT) -> list[int]:
+    total_count = int(total_count)
+    target_count = int(target_count)
+    if total_count <= 0 or target_count <= 0:
+        return []
+    if total_count <= target_count:
+        return list(range(total_count))
+    bins = np.array_split(np.arange(total_count), target_count)
+    return [int(chunk[len(chunk) // 2]) for chunk in bins if len(chunk) > 0]
+
+
+def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if field not in metric:
+        return None, None
+
+    values = np.asarray(metric[field], dtype=np.float64)
+    if values.ndim not in {1, 2} or values.shape[0] < 1:
+        return None, None
+
+    saved_indices = np.asarray(metric.get("display_layer_indices", []), dtype=np.int64)
+    if saved_indices.size == values.shape[0]:
+        return saved_indices, values
+
+    sampled_indices = np.asarray(uniform_center_indices(values.shape[0], DISPLAY_LAYER_COUNT), dtype=np.int64)
+    if sampled_indices.size < 1:
+        return None, None
+    return sampled_indices, values[sampled_indices]
+
+
+def attention_layer_means(records: list[dict[str, Any]], metric_name: str, field: str) -> tuple[np.ndarray | None, np.ndarray | None]:
     rows = []
+    display_indices: np.ndarray | None = None
     for record in valid_records(records):
         metric = record.get("metrics", {}).get(metric_name)
-        if metric and field in metric:
-            rows.append(np.asarray(metric[field], dtype=np.float64))
+        if not metric:
+            continue
+        layer_indices, values = normalized_metric_layer_array(metric, field)
+        if layer_indices is None or values is None:
+            continue
+        if display_indices is None:
+            display_indices = layer_indices
+        if values.shape[0] != display_indices.shape[0] or not np.array_equal(layer_indices, display_indices):
+            continue
+        rows.append(values)
     if not rows:
-        return None
-    return np.vstack(rows).mean(axis=0)
+        return None, None
+    return display_indices, np.vstack(rows).mean(axis=0)
 
 
-def interpolate_layer_percentiles(records: list[dict[str, Any]], metric_name: str, bins: int = 20) -> np.ndarray | None:
+def interpolate_layer_percentiles(
+    records: list[dict[str, Any]],
+    metric_name: str,
+    bins: int = 20,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
     stacked = []
+    display_indices: np.ndarray | None = None
     target_x = np.linspace(0.0, 1.0, bins)
     for record in valid_records(records):
         metric = record.get("metrics", {}).get(metric_name)
         if not metric:
             continue
-        layer_percentiles = np.asarray(metric.get("layer_attention_percentiles", []), dtype=np.float64)
+        layer_indices, layer_percentiles = normalized_metric_layer_array(metric, "layer_attention_percentiles")
+        if layer_indices is None or layer_percentiles is None:
+            continue
         if layer_percentiles.ndim != 2 or layer_percentiles.shape[1] < 1:
+            continue
+        if display_indices is None:
+            display_indices = layer_indices
+        if layer_percentiles.shape[0] != display_indices.shape[0] or not np.array_equal(layer_indices, display_indices):
             continue
         source_x = np.linspace(0.0, 1.0, layer_percentiles.shape[1])
         interpolated = np.stack(
@@ -86,8 +137,8 @@ def interpolate_layer_percentiles(records: list[dict[str, Any]], metric_name: st
         )
         stacked.append(interpolated)
     if not stacked:
-        return None
-    return np.stack(stacked, axis=0).mean(axis=0)
+        return None, None
+    return display_indices, np.stack(stacked, axis=0).mean(axis=0)
 
 
 def plot_violin_distribution(records: list[dict[str, Any]], plots_dir: Path) -> None:
@@ -183,15 +234,17 @@ def plot_layer_lines(records: list[dict[str, Any]], plots_dir: Path) -> None:
         ("question_prefill_attention", "Question Prefill"),
         ("first_token_attention", "First Token"),
     ):
-        mean_percentiles = attention_layer_means(records, metric_name, "layer_recent4_mean_percentile")
-        mean_overlap = attention_layer_means(records, metric_name, "layer_recent4_top4_overlap")
-        if mean_percentiles is not None:
-            x = np.arange(mean_percentiles.shape[0])
+        percentile_layers, mean_percentiles = attention_layer_means(records, metric_name, "layer_recent4_mean_percentile")
+        overlap_layers, mean_overlap = attention_layer_means(records, metric_name, "layer_recent4_top4_overlap")
+        if percentile_layers is not None and mean_percentiles is not None:
+            x = percentile_layers
             axes[0, 0].plot(x, mean_percentiles, label=label)
+            axes[0, 0].set_xticks(x)
             plotted = True
-        if mean_overlap is not None:
-            x = np.arange(mean_overlap.shape[0])
+        if overlap_layers is not None and mean_overlap is not None:
+            x = overlap_layers
             axes[1, 0].plot(x, mean_overlap, label=label)
+            axes[1, 0].set_xticks(x)
             plotted = True
     if not plotted:
         plt.close(fig)
@@ -216,25 +269,29 @@ def plot_layer_lines(records: list[dict[str, Any]], plots_dir: Path) -> None:
 def plot_layer_heatmaps(records: list[dict[str, Any]], plots_dir: Path) -> None:
     matrices = []
     labels = []
+    layer_index_sets = []
     for metric_name, label in (
         ("question_prefill_attention", "Question Prefill"),
         ("first_token_attention", "First Token"),
     ):
-        matrix = interpolate_layer_percentiles(records, metric_name)
-        if matrix is not None:
+        layer_indices, matrix = interpolate_layer_percentiles(records, metric_name)
+        if layer_indices is not None and matrix is not None:
             matrices.append(matrix)
             labels.append(label)
+            layer_index_sets.append(layer_indices)
     if not matrices:
         return
 
     fig, axes = plt.subplots(len(matrices), 1, figsize=(12, 4.5 * len(matrices)), squeeze=False)
-    for ax, matrix, label in zip(axes[:, 0], matrices, labels):
+    for ax, matrix, label, layer_indices in zip(axes[:, 0], matrices, labels, layer_index_sets):
         im = ax.imshow(matrix, aspect="auto", origin="lower", vmin=0.0, vmax=1.0, cmap="viridis")
         ax.set_title(f"{label}: Layer-wise Percentile Heatmap")
         ax.set_ylabel("Layer")
         ax.set_xlabel("Relative Frame Position")
         ax.set_xticks(np.linspace(0, matrix.shape[1] - 1, 5))
         ax.set_xticklabels([f"{value:.2f}" for value in np.linspace(0.0, 1.0, 5)])
+        ax.set_yticks(np.arange(layer_indices.shape[0]))
+        ax.set_yticklabels([str(int(index)) for index in layer_indices])
         recent_start = matrix.shape[1] * 0.75
         ax.axvspan(recent_start, matrix.shape[1] - 0.5, facecolor="white", alpha=0.12, edgecolor="none")
         fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
@@ -306,7 +363,9 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
     ):
         if metric_name not in metrics:
             continue
-        matrix = np.asarray(metrics[metric_name]["layer_attention_scores"], dtype=np.float64)
+        layer_indices, matrix = normalized_metric_layer_array(metrics[metric_name], "layer_attention_scores")
+        if layer_indices is None or matrix is None:
+            continue
         x_positions = np.asarray(
             metrics[metric_name].get("attention_frame_indices", list(range(matrix.shape[1]))),
             dtype=np.int64,
@@ -320,6 +379,8 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
         tick_labels = [str(int(x_positions[int(round(pos))])) for pos in tick_positions]
         ax.set_xticks(tick_positions)
         ax.set_xticklabels(tick_labels)
+        ax.set_yticks(np.arange(layer_indices.shape[0]))
+        ax.set_yticklabels([str(int(index)) for index in layer_indices])
         selected_recent = set(int(index) for index in metrics[metric_name].get("recent_frame_indices_within_attention", []))
         for local_index in selected_recent:
             ax.axvline(local_index, color="white", linestyle="--", linewidth=0.8, alpha=0.4)

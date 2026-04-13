@@ -13,6 +13,8 @@ from PIL import Image
 from lib.recent_window_eval import decode_video_to_chunks_qwen
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
+DISPLAY_LAYER_COUNT = 5
+
 
 def parse_csv_options(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     if value is None:
@@ -90,6 +92,17 @@ def summarize_scalar_metric(scores: list[float], recent_indices: list[int]) -> d
     }
 
 
+def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_COUNT) -> list[int]:
+    total_count = int(total_count)
+    target_count = int(target_count)
+    if total_count <= 0 or target_count <= 0:
+        return []
+    if total_count <= target_count:
+        return list(range(total_count))
+    bins = np.array_split(np.arange(total_count), target_count)
+    return [int(chunk[len(chunk) // 2]) for chunk in bins if len(chunk) > 0]
+
+
 def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[int], last_k_layers: int) -> dict[str, Any]:
     if layer_scores.ndim != 2:
         raise ValueError(f"Expected [layers, frames] scores, got shape={tuple(layer_scores.shape)}")
@@ -111,18 +124,43 @@ def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[
     last_k = max(1, min(int(last_k_layers), int(layer_scores.shape[0])))
     last_k_mean_scores = layer_scores[-last_k:].mean(dim=0)
     last_k_summary = summarize_scalar_metric(last_k_mean_scores.tolist(), recent_indices)
+    display_layer_indices = uniform_center_indices(layer_scores.shape[0], DISPLAY_LAYER_COUNT)
+    display_layer_scores = layer_scores[display_layer_indices]
+    display_layer_percentiles = layer_percentiles[display_layer_indices]
+    display_layer_recent_mean = [layer_recent_mean[index] for index in display_layer_indices]
+    display_layer_overlap = [layer_overlap[index] for index in display_layer_indices]
 
     return {
-        "layer_attention_scores": layer_scores.tolist(),
-        "layer_attention_percentiles": layer_percentiles.tolist(),
-        "layer_recent4_mean_percentile": [float(value) for value in layer_recent_mean],
-        "layer_recent4_top4_overlap": [float(value) for value in layer_overlap],
+        "num_layers_total": int(layer_scores.shape[0]),
+        "display_layer_indices": [int(index) for index in display_layer_indices],
+        "layer_attention_scores": display_layer_scores.tolist(),
+        "layer_attention_percentiles": display_layer_percentiles.tolist(),
+        "layer_recent4_mean_percentile": [float(value) for value in display_layer_recent_mean],
+        "layer_recent4_top4_overlap": [float(value) for value in display_layer_overlap],
         "last_k_layers_used": last_k,
         "last_k_layers_mean_attention_score": last_k_summary["frame_scores"],
         "last_k_layers_mean_percentile": last_k_summary["frame_percentiles"],
         "last_k_layers_recent4_mean_percentile": last_k_summary["recent4_mean_percentile"],
         "last_k_layers_recent4_top4_overlap": last_k_summary["recent4_top4_overlap"],
     }
+
+
+def sample_metric_layer_field(metric: dict[str, Any], field: str) -> tuple[np.ndarray | None, list[int]]:
+    if field not in metric:
+        return None, []
+
+    values = np.asarray(metric[field], dtype=np.float64)
+    if values.ndim not in {1, 2} or values.shape[0] < 1:
+        return None, []
+
+    saved_indices = [int(index) for index in metric.get("display_layer_indices", [])]
+    if len(saved_indices) == values.shape[0]:
+        return values, saved_indices
+
+    display_indices = uniform_center_indices(values.shape[0], DISPLAY_LAYER_COUNT)
+    if not display_indices:
+        return None, []
+    return values[display_indices], display_indices
 
 
 def cosine_scores_against_query(features: torch.Tensor, query_feature: torch.Tensor) -> torch.Tensor:
@@ -539,7 +577,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["question_prefill_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
                 metrics["question_prefill_attention"]["attention_sampling_strategy"] = attention_sampling_strategy
                 if save_example_matrices:
-                    example_payload["question_prefill_attention_scores"] = prefill_scores
+                    display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
+                    example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
                 if save_raw_attentions:
                     example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
 
@@ -579,7 +618,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["first_token_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
                 metrics["first_token_attention"]["attention_sampling_strategy"] = attention_sampling_strategy
                 if save_example_matrices:
-                    example_payload["first_token_attention_scores"] = decode_scores
+                    display_layer_indices = metrics["first_token_attention"]["display_layer_indices"]
+                    example_payload["first_token_attention_scores"] = decode_scores[display_layer_indices]
                     example_payload["first_token_id"] = int(first_token.item())
                 if save_raw_attentions:
                     example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
@@ -638,9 +678,25 @@ def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, An
     for name in attention_metric_names:
         values = [record["metrics"][name] for record in valid_records if name in record.get("metrics", {})]
         if values:
-            layer_recent = np.asarray([item["layer_recent4_mean_percentile"] for item in values], dtype=np.float64)
-            layer_overlap = np.asarray([item["layer_recent4_top4_overlap"] for item in values], dtype=np.float64)
-            summary["metrics"][name] = {
+            layer_recent_rows: list[np.ndarray] = []
+            layer_overlap_rows: list[np.ndarray] = []
+            display_layer_indices: list[int] = []
+            num_layers_total: int | None = None
+            for item in values:
+                recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile")
+                overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap")
+                if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
+                    continue
+                if display_layer_indices and recent_indices != display_layer_indices:
+                    continue
+                if not display_layer_indices:
+                    display_layer_indices = list(recent_indices)
+                layer_recent_rows.append(recent_row)
+                layer_overlap_rows.append(overlap_row)
+                if num_layers_total is None and item.get("num_layers_total") is not None:
+                    num_layers_total = int(item["num_layers_total"])
+
+            summary_payload = {
                 "count": len(values),
                 "last_k_layers_recent4_mean_percentile_mean": float(
                     np.mean([item["last_k_layers_recent4_mean_percentile"] for item in values], dtype=np.float64)
@@ -648,8 +704,13 @@ def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, An
                 "last_k_layers_recent4_top4_overlap_mean": float(
                     np.mean([item["last_k_layers_recent4_top4_overlap"] for item in values], dtype=np.float64)
                 ),
-                "layer_recent4_mean_percentile_mean": layer_recent.mean(axis=0).tolist(),
-                "layer_recent4_top4_overlap_mean": layer_overlap.mean(axis=0).tolist(),
             }
+            if layer_recent_rows and layer_overlap_rows:
+                summary_payload["display_layer_indices"] = display_layer_indices
+                summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
+                summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
+            if num_layers_total is not None:
+                summary_payload["num_layers_total"] = num_layers_total
+            summary["metrics"][name] = summary_payload
 
     return summary
