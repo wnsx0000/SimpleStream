@@ -142,12 +142,14 @@ python scoring/score_ovo_bench.py \
 <summary><b>Saliency Test</b></summary>
 
 Measures whether the `recent4` frames selected by SimpleStream are also salient
-among all sampled frames in the same window. The script computes:
-- Qwen3 feature similarity
-- SigLIP-SO400M feature similarity
+among all sampled frames in the same window for the OVO-Bench backward and
+realtime splits. The script computes:
+- SigLIP-SO400M frame-question similarity
 - Layer-wise Qwen3 attention scores for `question_prefill` and `first_token`
 
 Outputs are saved under `records.jsonl`, `summary.json`, `examples/`, and `plots/`.
+If the sampled window is longer than `--max_analysis_frames`, attention is
+computed on a uniform subsample while keeping the recent frames in the set.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python main_experiments/eval_qwen3vl_ovo_frame_saliency.py \
@@ -159,12 +161,14 @@ CUDA_VISIBLE_DEVICES=0 python main_experiments/eval_qwen3vl_ovo_frame_saliency.p
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --similarity_backends qwen,siglip \
+    --max_analysis_frames 32 \
+    --similarity_backends siglip \
     --attention_modes first_token,question_prefill \
     --attn_implementation eager
 ```
 
-Use `--analysis_scope full` to run the full OVO-Bench split instead of the smoke subset(8 samples per subset).
+Use `--analysis_scope full` to run the full backward/realtime splits instead of
+the smoke subset (8 samples per split).
 </details>
 
 ## 📢 Citation

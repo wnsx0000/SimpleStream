@@ -37,13 +37,14 @@ def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: 
     values: list[float] = []
     for record in valid_records(records):
         metric = record.get("metrics", {}).get(metric_name)
-        recent_indices = record.get("recent_frame_indices", [])
         if not metric:
             continue
         if metric_name.endswith("_attention"):
             frame_values = metric.get("last_k_layers_mean_percentile", [])
+            recent_indices = metric.get("recent_frame_indices_within_attention", [])
         else:
             frame_values = metric.get("frame_percentiles", [])
+            recent_indices = record.get("recent_frame_indices", [])
         values.extend(float(frame_values[idx]) for idx in recent_indices if 0 <= idx < len(frame_values))
     return values
 
@@ -91,8 +92,7 @@ def interpolate_layer_percentiles(records: list[dict[str, Any]], metric_name: st
 
 def plot_violin_distribution(records: list[dict[str, Any]], plots_dir: Path) -> None:
     metric_map = {
-        "qwen_similarity": "Qwen Similarity",
-        "siglip_similarity": "SigLIP Similarity",
+        "siglip_similarity": "SigLIP Frame-Question Similarity",
         "question_prefill_attention": "Question Prefill Attn",
         "first_token_attention": "First Token Attn",
     }
@@ -123,8 +123,7 @@ def plot_violin_distribution(records: list[dict[str, Any]], plots_dir: Path) -> 
 
 def plot_sample_histograms(records: list[dict[str, Any]], plots_dir: Path) -> None:
     metric_map = {
-        "qwen_similarity": "Qwen Similarity",
-        "siglip_similarity": "SigLIP Similarity",
+        "siglip_similarity": "SigLIP Frame-Question Similarity",
         "question_prefill_attention": "Question Prefill Attn",
         "first_token_attention": "First Token Attn",
     }
@@ -152,8 +151,7 @@ def plot_sample_histograms(records: list[dict[str, Any]], plots_dir: Path) -> No
 
 def plot_overlap_bars(records: list[dict[str, Any]], plots_dir: Path) -> None:
     metric_map = {
-        "qwen_similarity": ("Qwen Similarity", "recent4_top4_overlap"),
-        "siglip_similarity": ("SigLIP Similarity", "recent4_top4_overlap"),
+        "siglip_similarity": ("SigLIP Frame-Question Similarity", "recent4_top4_overlap"),
         "question_prefill_attention": ("Question Prefill Attn", "last_k_layers_recent4_top4_overlap"),
         "first_token_attention": ("First Token Attn", "last_k_layers_recent4_top4_overlap"),
     }
@@ -252,48 +250,41 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
     recent_indices = set(int(index) for index in payload.get("recent_frame_indices", []))
     example_dir = ensure_dir(plots_dir / "examples" / example_key)
 
-    qwen_matrix = payload.get("qwen_similarity_matrix")
-    siglip_matrix = payload.get("siglip_similarity_matrix")
-    if qwen_matrix is not None or siglip_matrix is not None:
-        matrices = []
-        titles = []
-        if qwen_matrix is not None:
-            matrices.append(np.asarray(qwen_matrix, dtype=np.float64))
-            titles.append("Qwen Similarity")
-        if siglip_matrix is not None:
-            matrices.append(np.asarray(siglip_matrix, dtype=np.float64))
-            titles.append("SigLIP Similarity")
-        fig, axes = plt.subplots(1, len(matrices), figsize=(6 * len(matrices), 5), squeeze=False)
-        for ax, matrix, title in zip(axes[0], matrices, titles):
-            im = ax.imshow(matrix, origin="lower", aspect="auto", vmin=-1.0, vmax=1.0, cmap="coolwarm")
-            ax.set_title(title)
-            ax.set_xlabel("Frame Index")
-            ax.set_ylabel("Frame Index")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        fig.savefig(example_dir / "similarity_heatmaps.png", dpi=200)
-        plt.close(fig)
-
     metrics = payload.get("metrics", {})
     frame_indices = np.arange(len(frame_rows))
     line_plotted = False
     fig, ax = plt.subplots(figsize=(11, 5))
-    if "qwen_similarity" in metrics:
-        ax.plot(frame_indices, metrics["qwen_similarity"]["frame_scores"], label="Qwen Similarity")
-        line_plotted = True
     if "siglip_similarity" in metrics:
-        ax.plot(frame_indices, metrics["siglip_similarity"]["frame_scores"], label="SigLIP Similarity")
-        line_plotted = True
-    if "question_prefill_attention" in metrics:
         ax.plot(
             frame_indices,
+            metrics["siglip_similarity"]["frame_scores"],
+            label="SigLIP Frame-Question Similarity",
+        )
+        line_plotted = True
+    if "question_prefill_attention" in metrics:
+        attn_x = np.asarray(
+            metrics["question_prefill_attention"].get(
+                "attention_frame_indices",
+                list(range(len(metrics["question_prefill_attention"]["last_k_layers_mean_attention_score"]))),
+            ),
+            dtype=np.int64,
+        )
+        ax.plot(
+            attn_x,
             metrics["question_prefill_attention"]["last_k_layers_mean_attention_score"],
             label="Question Prefill Attn",
         )
         line_plotted = True
     if "first_token_attention" in metrics:
+        attn_x = np.asarray(
+            metrics["first_token_attention"].get(
+                "attention_frame_indices",
+                list(range(len(metrics["first_token_attention"]["last_k_layers_mean_attention_score"]))),
+            ),
+            dtype=np.int64,
+        )
         ax.plot(
-            frame_indices,
+            attn_x,
             metrics["first_token_attention"]["last_k_layers_mean_attention_score"],
             label="First Token Attn",
         )
@@ -316,13 +307,22 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
         if metric_name not in metrics:
             continue
         matrix = np.asarray(metrics[metric_name]["layer_attention_scores"], dtype=np.float64)
+        x_positions = np.asarray(
+            metrics[metric_name].get("attention_frame_indices", list(range(matrix.shape[1]))),
+            dtype=np.int64,
+        )
         fig, ax = plt.subplots(figsize=(11, 5))
         im = ax.imshow(matrix, aspect="auto", origin="lower", cmap="magma")
         ax.set_title(f"{title} Attention Heatmap: {example_key}")
         ax.set_xlabel("Frame Index")
         ax.set_ylabel("Layer")
-        for index in recent_indices:
-            ax.axvline(index, color="white", linestyle="--", linewidth=0.8, alpha=0.4)
+        tick_positions = np.linspace(0, matrix.shape[1] - 1, min(6, matrix.shape[1]))
+        tick_labels = [str(int(x_positions[int(round(pos))])) for pos in tick_positions]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels)
+        selected_recent = set(int(index) for index in metrics[metric_name].get("recent_frame_indices_within_attention", []))
+        for local_index in selected_recent:
+            ax.axvline(local_index, color="white", linestyle="--", linewidth=0.8, alpha=0.4)
         fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
         fig.tight_layout()
         fig.savefig(example_dir / f"{metric_name}_heatmap.png", dpi=200)

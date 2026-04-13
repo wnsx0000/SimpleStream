@@ -125,20 +125,14 @@ def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[
     }
 
 
-def pairwise_cosine_matrix(features: torch.Tensor) -> torch.Tensor:
+def cosine_scores_against_query(features: torch.Tensor, query_feature: torch.Tensor) -> torch.Tensor:
     if features.ndim != 2:
         raise ValueError(f"Expected [frames, dim] features, got shape={tuple(features.shape)}")
-    normalized = F.normalize(features.float(), dim=-1)
-    return normalized @ normalized.transpose(0, 1)
-
-
-def centrality_from_similarity_matrix(matrix: torch.Tensor) -> torch.Tensor:
-    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
-        raise ValueError(f"Expected square matrix, got shape={tuple(matrix.shape)}")
-    if matrix.shape[0] == 1:
-        return torch.ones(1, dtype=torch.float32, device=matrix.device)
-    total = matrix.sum(dim=-1) - torch.diag(matrix)
-    return total / float(matrix.shape[0] - 1)
+    if query_feature.ndim != 1:
+        raise ValueError(f"Expected [dim] query feature, got shape={tuple(query_feature.shape)}")
+    normalized_features = F.normalize(features.float(), dim=-1)
+    normalized_query = F.normalize(query_feature.float(), dim=-1)
+    return normalized_features @ normalized_query
 
 
 def frame_token_counts_from_grid(grid_thw: torch.Tensor, merge_size: int) -> list[int]:
@@ -153,17 +147,56 @@ def frame_token_counts_from_grid(grid_thw: torch.Tensor, merge_size: int) -> lis
     return counts
 
 
-def pool_frame_features(token_features: torch.Tensor, frame_token_counts: list[int]) -> torch.Tensor:
-    pooled: list[torch.Tensor] = []
+def select_rows_by_frame_indices(
+    token_features: torch.Tensor,
+    frame_token_counts: list[int],
+    selected_frame_indices: list[int],
+) -> tuple[torch.Tensor, list[int]]:
+    selected_rows: list[torch.Tensor] = []
+    selected_counts: list[int] = []
     offset = 0
-    for count in frame_token_counts:
-        pooled.append(token_features[offset : offset + count].mean(dim=0))
+    wanted = set(int(index) for index in selected_frame_indices)
+    for frame_idx, count in enumerate(frame_token_counts):
+        if frame_idx in wanted:
+            selected_rows.append(token_features[offset : offset + count])
+            selected_counts.append(int(count))
         offset += count
     if offset != int(token_features.shape[0]):
         raise ValueError(
             f"Frame token counts do not cover all vision tokens: total={token_features.shape[0]} covered={offset}"
         )
-    return torch.stack(pooled, dim=0)
+    if not selected_rows:
+        raise ValueError("No frame token rows selected for attention analysis.")
+    return torch.cat(selected_rows, dim=0), selected_counts
+
+
+def evenly_spaced_indices(items: list[int], target_count: int) -> list[int]:
+    if target_count <= 0 or not items:
+        return []
+    if target_count >= len(items):
+        return list(items)
+    positions = np.array_split(np.arange(len(items)), target_count)
+    return [int(items[int(chunk[len(chunk) // 2])]) for chunk in positions if len(chunk) > 0]
+
+
+def select_attention_frame_indices(
+    total_frames: int,
+    recent_indices: list[int],
+    max_analysis_frames: int,
+) -> tuple[list[int], str]:
+    if total_frames <= int(max_analysis_frames):
+        return list(range(total_frames)), "all_frames"
+
+    unique_recent = sorted(set(int(index) for index in recent_indices if 0 <= int(index) < total_frames))
+    if len(unique_recent) >= int(max_analysis_frames):
+        selected = evenly_spaced_indices(unique_recent, int(max_analysis_frames))
+        return sorted(selected), "uniform_recent_only"
+
+    remaining_budget = int(max_analysis_frames) - len(unique_recent)
+    candidate_indices = [index for index in range(total_frames) if index not in set(unique_recent)]
+    sampled_context = evenly_spaced_indices(candidate_indices, remaining_budget)
+    selected = sorted(set(unique_recent + sampled_context))
+    return selected, "uniform_with_recent_anchor"
 
 
 def flatten_chunks(
@@ -266,6 +299,24 @@ class SiglipFrameEncoder:
             features = self.model.get_image_features(pixel_values=pixel_values)
             batches.append(F.normalize(features.float(), dim=-1).cpu())
         return torch.cat(batches, dim=0)
+
+    @torch.inference_mode()
+    def encode_text(self, text: str) -> torch.Tensor:
+        query_text = str(text).strip()
+        if not query_text:
+            raise ValueError("SigLIP frame-question similarity requires a non-empty question.")
+
+        inputs = self.processor(text=[query_text], padding=True, truncation=True, return_tensors="pt")
+        text_inputs = {
+            key: value.to(self.device)
+            for key, value in inputs.items()
+            if key in {"input_ids", "attention_mask", "token_type_ids", "position_ids"}
+        }
+        if not text_inputs:
+            raise RuntimeError("SigLIP processor did not produce text inputs.")
+
+        features = self.model.get_text_features(**text_inputs)
+        return F.normalize(features.float(), dim=-1)[0].cpu()
 
 
 class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
@@ -390,6 +441,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         self,
         video_path: str,
         prompt: str,
+        similarity_text: str | None,
         chunk_duration: float,
         fps: float,
         recent_frames_only: int,
@@ -410,9 +462,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             raise ValueError(f"No chunks decoded from video: {video_path}")
 
         frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
-        cached_embeds, cached_grid_thw = self.encode_vision(frames)
-        frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, self.merge_size)
-        qwen_frame_features = pool_frame_features(cached_embeds, frame_token_counts)
 
         metrics: dict[str, Any] = {}
         example_payload: dict[str, Any] = {
@@ -423,88 +472,108 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             "recent_chunk_ids": recent_chunk_ids,
         } if (save_example_matrices or save_raw_attentions) else {}
 
-        if "qwen" in similarity_backends:
-            qwen_matrix = pairwise_cosine_matrix(qwen_frame_features)
-            qwen_scores = centrality_from_similarity_matrix(qwen_matrix).tolist()
-            metrics["qwen_similarity"] = summarize_scalar_metric(qwen_scores, recent_indices)
-            if save_example_matrices:
-                example_payload["qwen_similarity_matrix"] = qwen_matrix.detach().cpu()
-
         if "siglip" in similarity_backends:
-            siglip_features = self.get_siglip_encoder().encode_frames(frames)
-            siglip_matrix = pairwise_cosine_matrix(siglip_features)
-            siglip_scores = centrality_from_similarity_matrix(siglip_matrix).tolist()
+            siglip_encoder = self.get_siglip_encoder()
+            siglip_features = siglip_encoder.encode_frames(frames)
+            siglip_question_feature = siglip_encoder.encode_text(similarity_text or "")
+            siglip_scores = cosine_scores_against_query(siglip_features, siglip_question_feature).tolist()
             metrics["siglip_similarity"] = summarize_scalar_metric(siglip_scores, recent_indices)
             if save_example_matrices:
-                example_payload["siglip_similarity_matrix"] = siglip_matrix.detach().cpu()
+                example_payload["siglip_similarity_query"] = str(similarity_text or "")
 
         attention_skipped_reason: str | None = None
+        attention_frame_indices = list(range(len(frames)))
+        attention_recent_indices: list[int] = recent_indices
+        attention_sampling_strategy = "all_frames"
         if attention_modes:
-            if len(frames) > int(max_analysis_frames):
-                attention_skipped_reason = (
-                    f"Skipped attention analysis because num_frames={len(frames)} exceeds "
-                    f"--max-analysis-frames={max_analysis_frames}."
-                )
-            else:
-                inputs = self._build_cached_multimodal_inputs(
-                    cached_embeds=cached_embeds,
-                    cached_grid_thw=cached_grid_thw,
-                    frame_token_counts=frame_token_counts,
-                    question=prompt,
-                )
-                prefill_collector = None
-                if "question_prefill" in attention_modes:
-                    prefill_collector = LayerwiseFrameAttentionCollector(
-                        frame_token_spans=inputs["frame_token_spans"],
-                        query_positions=inputs["question_token_positions"],
-                        num_layers=len(self._get_text_layers()),
-                        save_raw=save_raw_attentions,
-                    )
+            cached_embeds, cached_grid_thw = self.encode_vision(frames)
+            frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, self.merge_size)
+            attention_frame_indices, attention_sampling_strategy = select_attention_frame_indices(
+                total_frames=len(frames),
+                recent_indices=recent_indices,
+                max_analysis_frames=max_analysis_frames,
+            )
+            attention_index_lookup = {frame_idx: local_idx for local_idx, frame_idx in enumerate(attention_frame_indices)}
+            attention_recent_indices = [
+                attention_index_lookup[frame_idx]
+                for frame_idx in recent_indices
+                if frame_idx in attention_index_lookup
+            ]
 
-                prefill_outputs = self._run_with_collector(
-                    prefill_collector,
-                    input_ids=None,
-                    inputs_embeds=inputs["inputs_embeds"],
-                    attention_mask=inputs["attention_mask"],
-                    position_ids=inputs["position_ids"],
+            attention_embeds, attention_frame_token_counts = select_rows_by_frame_indices(
+                token_features=cached_embeds,
+                frame_token_counts=frame_token_counts,
+                selected_frame_indices=attention_frame_indices,
+            )
+            attention_grid = cached_grid_thw[attention_frame_indices]
+            for row in frame_rows:
+                row["used_for_attention"] = bool(int(row["frame_index"]) in attention_index_lookup)
+
+            inputs = self._build_cached_multimodal_inputs(
+                cached_embeds=attention_embeds,
+                cached_grid_thw=attention_grid,
+                frame_token_counts=attention_frame_token_counts,
+                question=prompt,
+            )
+            prefill_collector = None
+            if "question_prefill" in attention_modes:
+                prefill_collector = LayerwiseFrameAttentionCollector(
+                    frame_token_spans=inputs["frame_token_spans"],
+                    query_positions=inputs["question_token_positions"],
+                    num_layers=len(self._get_text_layers()),
+                    save_raw=save_raw_attentions,
                 )
 
-                if prefill_collector is not None:
-                    prefill_scores = prefill_collector.as_tensor()
-                    metrics["question_prefill_attention"] = summarize_layerwise_metric(
-                        prefill_scores,
-                        recent_indices=recent_indices,
-                        last_k_layers=attention_last_k_layers,
-                    )
-                    if save_example_matrices:
-                        example_payload["question_prefill_attention_scores"] = prefill_scores
-                    if save_raw_attentions:
-                        example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
+            prefill_outputs = self._run_with_collector(
+                prefill_collector,
+                input_ids=None,
+                inputs_embeds=inputs["inputs_embeds"],
+                attention_mask=inputs["attention_mask"],
+                position_ids=inputs["position_ids"],
+            )
 
-                if "first_token" in attention_modes:
-                    first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
-                    decode_collector = LayerwiseFrameAttentionCollector(
-                        frame_token_spans=inputs["frame_token_spans"],
-                        query_positions=[0],
-                        num_layers=len(self._get_text_layers()),
-                        save_raw=save_raw_attentions,
-                    )
-                    self._run_with_collector(
-                        decode_collector,
-                        input_ids=first_token[:, None],
-                        past_key_values=prefill_outputs.past_key_values,
-                    )
-                    decode_scores = decode_collector.as_tensor()
-                    metrics["first_token_attention"] = summarize_layerwise_metric(
-                        decode_scores,
-                        recent_indices=recent_indices,
-                        last_k_layers=attention_last_k_layers,
-                    )
-                    if save_example_matrices:
-                        example_payload["first_token_attention_scores"] = decode_scores
-                        example_payload["first_token_id"] = int(first_token.item())
-                    if save_raw_attentions:
-                        example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
+            if prefill_collector is not None:
+                prefill_scores = prefill_collector.as_tensor()
+                metrics["question_prefill_attention"] = summarize_layerwise_metric(
+                    prefill_scores,
+                    recent_indices=attention_recent_indices,
+                    last_k_layers=attention_last_k_layers,
+                )
+                metrics["question_prefill_attention"]["attention_frame_indices"] = attention_frame_indices
+                metrics["question_prefill_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
+                metrics["question_prefill_attention"]["attention_sampling_strategy"] = attention_sampling_strategy
+                if save_example_matrices:
+                    example_payload["question_prefill_attention_scores"] = prefill_scores
+                if save_raw_attentions:
+                    example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
+
+            if "first_token" in attention_modes:
+                first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
+                decode_collector = LayerwiseFrameAttentionCollector(
+                    frame_token_spans=inputs["frame_token_spans"],
+                    query_positions=[0],
+                    num_layers=len(self._get_text_layers()),
+                    save_raw=save_raw_attentions,
+                )
+                self._run_with_collector(
+                    decode_collector,
+                    input_ids=first_token[:, None],
+                    past_key_values=prefill_outputs.past_key_values,
+                )
+                decode_scores = decode_collector.as_tensor()
+                metrics["first_token_attention"] = summarize_layerwise_metric(
+                    decode_scores,
+                    recent_indices=attention_recent_indices,
+                    last_k_layers=attention_last_k_layers,
+                )
+                metrics["first_token_attention"]["attention_frame_indices"] = attention_frame_indices
+                metrics["first_token_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
+                metrics["first_token_attention"]["attention_sampling_strategy"] = attention_sampling_strategy
+                if save_example_matrices:
+                    example_payload["first_token_attention_scores"] = decode_scores
+                    example_payload["first_token_id"] = int(first_token.item())
+                if save_raw_attentions:
+                    example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
 
         record = {
             "video_path": video_path,
@@ -512,6 +581,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             "num_sampled_frames": len(frames),
             "recent_chunk_ids": recent_chunk_ids,
             "recent_frame_indices": recent_indices,
+            "attention_frame_indices": attention_frame_indices,
+            "attention_sampling_strategy": attention_sampling_strategy,
             "frames": frame_rows,
             "metrics": metrics,
             "attention_skipped_reason": attention_skipped_reason,
@@ -539,7 +610,7 @@ def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, An
     for task, task_records in sorted(task_groups.items()):
         summary["tasks"][task] = {"count": len(task_records)}
 
-    scalar_metric_names = ["qwen_similarity", "siglip_similarity"]
+    scalar_metric_names = ["siglip_similarity"]
     attention_metric_names = ["question_prefill_attention", "first_token_attention"]
 
     for name in scalar_metric_names:

@@ -2,9 +2,8 @@
 OVO-Bench recent4 saliency analysis for Qwen3-VL.
 
 This analysis compares the frames selected by SimpleStream's recent4 policy
-against all sampled frames in the same decoded clip using:
-- Qwen3 visual feature similarity
-- SigLIP-SO400M visual feature similarity
+on the backward and realtime OVO-Bench splits using:
+- SigLIP-SO400M frame-question similarity
 - Qwen3 text self-attention aggregated layer-wise
 """
 
@@ -32,13 +31,11 @@ from lib.frame_saliency_qwen3 import (  # noqa: E402
     slugify,
 )
 from lib.recent_window_eval import build_ovo_prompt, load_jsonl_results  # noqa: E402
-from ovo_constants import BACKWARD_TASKS, FORWARD_TASKS, REAL_TIME_TASKS  # noqa: E402
+from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS  # noqa: E402
 
 
-def make_key(task: str, sample_id: Any, index: int | None = None) -> str:
-    if index is None:
-        return f"{task}:{sample_id}"
-    return f"{task}:{sample_id}:{index}"
+def make_key(task: str, sample_id: Any) -> str:
+    return f"{task}:{sample_id}"
 
 
 def smoke_cap_or_default(scope: str, max_samples_per_split: int | None) -> int | None:
@@ -52,14 +49,6 @@ def append_record(handle: Any, record: dict[str, Any]) -> None:
     handle.flush()
 
 
-def resolve_forward_ground_truth(task: str, test_info: dict[str, Any]) -> Any:
-    if task == "REC":
-        return int(test_info.get("count", 0))
-    if task in {"SSR", "CRR"}:
-        return "Yes" if int(test_info.get("type", 0)) == 1 else "No"
-    return None
-
-
 def maybe_generate_plots(result_dir: str) -> str | None:
     try:
         from analysis.plot_recent_frame_saliency import generate_plots
@@ -71,7 +60,7 @@ def maybe_generate_plots(result_dir: str) -> str | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OVO-Bench recent4 frame saliency analysis for Qwen3-VL")
+    parser = argparse.ArgumentParser(description="OVO-Bench backward/realtime recent4 saliency analysis for Qwen3-VL")
     parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
     parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
@@ -81,7 +70,7 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="smoke")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
-    parser.add_argument("--similarity_backends", default="qwen,siglip")
+    parser.add_argument("--similarity_backends", default="siglip")
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
     parser.add_argument("--attention_modes", default="first_token,question_prefill")
     parser.add_argument("--attention_last_k_layers", type=int, default=8)
@@ -95,7 +84,7 @@ def main() -> None:
 
     similarity_backends = parse_csv_options(args.similarity_backends)
     attention_modes = parse_csv_options(args.attention_modes)
-    supported_similarity = {"qwen", "siglip"}
+    supported_similarity = {"siglip"}
     supported_attention = {"first_token", "question_prefill"}
     unsupported_similarity = sorted(set(similarity_backends) - supported_similarity)
     unsupported_attention = sorted(set(attention_modes) - supported_attention)
@@ -113,16 +102,13 @@ def main() -> None:
 
     backward_anno = [anno for anno in annotations if anno["task"] in BACKWARD_TASKS]
     realtime_anno = [anno for anno in annotations if anno["task"] in REAL_TIME_TASKS]
-    forward_anno = [anno for anno in annotations if anno["task"] in FORWARD_TASKS]
 
     random.seed(args.seed)
     random.shuffle(backward_anno)
     random.shuffle(realtime_anno)
-    random.shuffle(forward_anno)
     if sample_cap is not None:
         backward_anno = backward_anno[:sample_cap]
         realtime_anno = realtime_anno[:sample_cap]
-        forward_anno = forward_anno[:sample_cap]
 
     result_dir = Path(args.result_dir)
     records_path = result_dir / "records.jsonl"
@@ -139,7 +125,6 @@ def main() -> None:
     print("=" * 60)
     print(f"Backward: {len(backward_anno)}")
     print(f"Realtime: {len(realtime_anno)}")
-    print(f"Forward: {len(forward_anno)}")
     print(f"Similarity: {similarity_backends or 'disabled'}")
     print(f"Attention: {attention_modes or 'disabled'}")
     print(f"Scope: {args.analysis_scope}")
@@ -174,6 +159,7 @@ def main() -> None:
                     record, example_payload = analyzer.analyze_sample(
                         video_path=video_path,
                         prompt=build_ovo_prompt(anno["task"], anno),
+                        similarity_text=str(anno.get("question", "")).strip(),
                         chunk_duration=args.chunk_duration,
                         fps=args.fps,
                         recent_frames_only=args.recent_frames_only,
@@ -219,75 +205,6 @@ def main() -> None:
                         "video": anno.get("video"),
                         "question": anno.get("question"),
                         "ground_truth": chr(65 + int(anno["gt"])),
-                        "video_path": video_path,
-                        "error": str(exc),
-                    }
-
-                append_record(handle, output)
-                all_records.append(output)
-                done_keys.add(key)
-
-        for anno in tqdm(forward_anno, desc="Forward"):
-            for index, test_info in enumerate(anno["test_info"]):
-                key = make_key(anno["task"], anno["id"], index=index)
-                if key in done_keys:
-                    continue
-
-                video_path = os.path.join(args.chunked_dir, f"{anno['id']}_{index}.mp4")
-                save_example = saved_examples < int(args.save_example_matrices)
-                save_raw = saved_raw < int(args.save_raw_attn_examples)
-
-                try:
-                    record, example_payload = analyzer.analyze_sample(
-                        video_path=video_path,
-                        prompt=build_ovo_prompt(anno["task"], anno, index=index),
-                        chunk_duration=args.chunk_duration,
-                        fps=args.fps,
-                        recent_frames_only=args.recent_frames_only,
-                        similarity_backends=similarity_backends,
-                        attention_modes=attention_modes,
-                        attention_last_k_layers=args.attention_last_k_layers,
-                        max_analysis_frames=args.max_analysis_frames,
-                        save_example_matrices=save_example,
-                        save_raw_attentions=save_raw,
-                    )
-                    output = {
-                        "_key": key,
-                        "split": "forward",
-                        "id": anno["id"],
-                        "sub_index": index,
-                        "task": anno["task"],
-                        "video": anno.get("video"),
-                        "question": anno.get("question"),
-                        "ground_truth": resolve_forward_ground_truth(anno["task"], test_info),
-                        **record,
-                    }
-                    if example_payload is not None:
-                        example_name = slugify(key) or f"example-{len(all_records)}"
-                        example_path = examples_dir / f"{example_name}.pt"
-                        torch.save(example_payload, example_path)
-                        output["example_saved"] = True
-                        output["matrix_example_saved"] = bool(save_example)
-                        output["raw_attention_saved"] = bool(save_raw)
-                        output["example_path"] = str(example_path)
-                        if save_example:
-                            saved_examples += 1
-                        if save_raw:
-                            saved_raw += 1
-                    else:
-                        output["example_saved"] = False
-                        output["matrix_example_saved"] = False
-                        output["raw_attention_saved"] = False
-                except Exception as exc:
-                    output = {
-                        "_key": key,
-                        "split": "forward",
-                        "id": anno["id"],
-                        "sub_index": index,
-                        "task": anno["task"],
-                        "video": anno.get("video"),
-                        "question": anno.get("question"),
-                        "ground_truth": resolve_forward_ground_truth(anno["task"], test_info),
                         "video_path": video_path,
                         "error": str(exc),
                     }
