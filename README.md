@@ -41,6 +41,10 @@ A sliding-window baseline that feeds only the most recent ***N*** frames to an o
 ```bash
 conda create -n simplestream python=3.10 -y
 conda activate simplestream
+
+# for my environment
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
 pip install -r requirements.txt
 # Optional: faster attention backend
 pip install flash-attn --no-build-isolation
@@ -151,8 +155,10 @@ Outputs are saved under `records.jsonl`, `summary.json`, `examples/`, and `plots
 If the sampled window is longer than `--max_analysis_frames`, attention is
 computed on a uniform subsample while keeping the recent frames in the set.
 
+<!-- CUDA_LAUNCH_BLOCKING=1  -->
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python main_experiments/eval_qwen3vl_ovo_frame_saliency.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_frame_saliency.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
