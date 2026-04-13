@@ -509,30 +509,26 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             for row in frame_rows:
                 row["used_for_attention"] = bool(int(row["frame_index"]) in attention_index_lookup)
 
-            inputs = self._build_cached_multimodal_inputs(
-                cached_embeds=attention_embeds,
-                cached_grid_thw=attention_grid,
-                frame_token_counts=attention_frame_token_counts,
-                question=prompt,
-            )
-            prefill_collector = None
             if "question_prefill" in attention_modes:
+                question_only_inputs = self._build_cached_multimodal_inputs(
+                    cached_embeds=attention_embeds,
+                    cached_grid_thw=attention_grid,
+                    frame_token_counts=attention_frame_token_counts,
+                    question=similarity_text or "",
+                )
                 prefill_collector = LayerwiseFrameAttentionCollector(
-                    frame_token_spans=inputs["frame_token_spans"],
-                    query_positions=inputs["question_token_positions"],
+                    frame_token_spans=question_only_inputs["frame_token_spans"],
+                    query_positions=question_only_inputs["question_token_positions"],
                     num_layers=len(self._get_text_layers()),
                     save_raw=save_raw_attentions,
                 )
-
-            prefill_outputs = self._run_with_collector(
-                prefill_collector,
-                input_ids=None,
-                inputs_embeds=inputs["inputs_embeds"],
-                attention_mask=inputs["attention_mask"],
-                position_ids=inputs["position_ids"],
-            )
-
-            if prefill_collector is not None:
+                self._run_with_collector(
+                    prefill_collector,
+                    input_ids=None,
+                    inputs_embeds=question_only_inputs["inputs_embeds"],
+                    attention_mask=question_only_inputs["attention_mask"],
+                    position_ids=question_only_inputs["position_ids"],
+                )
                 prefill_scores = prefill_collector.as_tensor()
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
                     prefill_scores,
@@ -548,9 +544,22 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
 
             if "first_token" in attention_modes:
+                full_prompt_inputs = self._build_cached_multimodal_inputs(
+                    cached_embeds=attention_embeds,
+                    cached_grid_thw=attention_grid,
+                    frame_token_counts=attention_frame_token_counts,
+                    question=prompt,
+                )
+                prefill_outputs = self._run_with_collector(
+                    None,
+                    input_ids=None,
+                    inputs_embeds=full_prompt_inputs["inputs_embeds"],
+                    attention_mask=full_prompt_inputs["attention_mask"],
+                    position_ids=full_prompt_inputs["position_ids"],
+                )
                 first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
                 decode_collector = LayerwiseFrameAttentionCollector(
-                    frame_token_spans=inputs["frame_token_spans"],
+                    frame_token_spans=full_prompt_inputs["frame_token_spans"],
                     query_positions=[0],
                     num_layers=len(self._get_text_layers()),
                     save_raw=save_raw_attentions,
