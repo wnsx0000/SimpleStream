@@ -2,7 +2,7 @@
 torch>=2.1.0
 # Qwen3-VL model output includes attention map from version 5.0.0
 transformers==5.0.0
-# transformers>=4.57.0
+# transformers>=5.0.0
 accelerate>=0.25.0
 
 # Video processing
@@ -18,6 +18,10 @@ torchvision>=0.16.0
 
 # Plotting
 matplotlib>=3.8.0
+
+# SigLIP
+sentencepiece
+protobuf
 
 # Optional: flash attention (recommended for speed)
 # pip install flash-attn --no-build-isolation

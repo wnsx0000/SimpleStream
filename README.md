@@ -183,7 +183,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_frame_sali
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_frame_saliency_smoke \
+    --result_dir main_experiments/results/ovo_qwen3vl_frame_saliency_smoke_$(date +%Y%m%d_%H%M%S) \
     --analysis_scope smoke \
     --recent_frames_only 4 \
     --chunk_duration 1.0 \

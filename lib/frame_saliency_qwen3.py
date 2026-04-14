@@ -185,29 +185,6 @@ def frame_token_counts_from_grid(grid_thw: torch.Tensor, merge_size: int) -> lis
     return counts
 
 
-def select_rows_by_frame_indices(
-    token_features: torch.Tensor,
-    frame_token_counts: list[int],
-    selected_frame_indices: list[int],
-) -> tuple[torch.Tensor, list[int]]:
-    selected_rows: list[torch.Tensor] = []
-    selected_counts: list[int] = []
-    offset = 0
-    wanted = set(int(index) for index in selected_frame_indices)
-    for frame_idx, count in enumerate(frame_token_counts):
-        if frame_idx in wanted:
-            selected_rows.append(token_features[offset : offset + count])
-            selected_counts.append(int(count))
-        offset += count
-    if offset != int(token_features.shape[0]):
-        raise ValueError(
-            f"Frame token counts do not cover all vision tokens: total={token_features.shape[0]} covered={offset}"
-        )
-    if not selected_rows:
-        raise ValueError("No frame token rows selected for attention analysis.")
-    return torch.cat(selected_rows, dim=0), selected_counts
-
-
 def evenly_spaced_indices(items: list[int], target_count: int) -> list[int]:
     if target_count <= 0 or not items:
         return []
@@ -327,6 +304,19 @@ class SiglipFrameEncoder:
         self.model.to(self.device)
         self.model.eval()
 
+    def _as_feature_tensor(self, value: Any, source: str) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value
+        pooled = getattr(value, "pooler_output", None)
+        if isinstance(pooled, torch.Tensor):
+            return pooled
+        hidden = getattr(value, "last_hidden_state", None)
+        if isinstance(hidden, torch.Tensor):
+            return hidden
+        if isinstance(value, (tuple, list)) and value and isinstance(value[0], torch.Tensor):
+            return value[0]
+        raise TypeError(f"Unexpected SigLIP {source} feature type: {type(value)}")
+
     @torch.inference_mode()
     def encode_frames(self, frames: list[Image.Image], batch_size: int = 16) -> torch.Tensor:
         batches: list[torch.Tensor] = []
@@ -334,7 +324,10 @@ class SiglipFrameEncoder:
             batch_frames = frames[start : start + batch_size]
             inputs = self.processor(images=batch_frames, return_tensors="pt")
             pixel_values = inputs["pixel_values"].to(self.device)
-            features = self.model.get_image_features(pixel_values=pixel_values)
+            features = self._as_feature_tensor(
+                self.model.get_image_features(pixel_values=pixel_values),
+                source="image",
+            )
             batches.append(F.normalize(features.float(), dim=-1).cpu())
         return torch.cat(batches, dim=0)
 
@@ -353,7 +346,10 @@ class SiglipFrameEncoder:
         if not text_inputs:
             raise RuntimeError("SigLIP processor did not produce text inputs.")
 
-        features = self.model.get_text_features(**text_inputs)
+        features = self._as_feature_tensor(
+            self.model.get_text_features(**text_inputs),
+            source="text",
+        )
         return F.normalize(features.float(), dim=-1)[0].cpu()
 
 
@@ -382,11 +378,29 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         return self._siglip_encoder
 
     def _get_text_layers(self) -> list[Any]:
+        pending = [self._get_text_model()]
+        visited: set[int] = set()
+        while pending:
+            module = pending.pop(0)
+            module_id = id(module)
+            if module_id in visited:
+                continue
+            visited.add(module_id)
+
+            layers = getattr(module, "layers", None)
+            if layers is not None:
+                return list(layers)
+
+            for attr_name in ("language_model", "model", "decoder"):
+                child = getattr(module, attr_name, None)
+                if child is not None:
+                    pending.append(child)
+
         text_model = self._get_text_model()
-        layers = getattr(text_model, "layers", None)
-        if layers is None:
-            raise RuntimeError("Unable to locate Qwen3 text decoder layers for attention capture.")
-        return list(layers)
+        raise RuntimeError(
+            "Unable to locate Qwen3 text decoder layers for attention capture. "
+            f"text_model_type={type(text_model).__name__}"
+        )
 
     def _build_cached_multimodal_inputs(
         self,
@@ -529,9 +543,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         attention_recent_indices: list[int] = recent_indices
         attention_sampling_strategy = "all_frames"
         if attention_modes:
-            # Compute vision embeddings once and choose the frame subset to use for attention analysis.
-            cached_embeds, cached_grid_thw = self.encode_vision(frames)
-            frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, self.merge_size)
             attention_frame_indices, attention_sampling_strategy = select_attention_frame_indices(
                 total_frames=len(frames),
                 recent_indices=recent_indices,
@@ -544,13 +555,10 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if frame_idx in attention_index_lookup
             ]
 
-            # Slice token features and frame metadata down to the selected attention frame subset.
-            attention_embeds, attention_frame_token_counts = select_rows_by_frame_indices(
-                token_features=cached_embeds,
-                frame_token_counts=frame_token_counts,
-                selected_frame_indices=attention_frame_indices,
-            )
-            attention_grid = cached_grid_thw[attention_frame_indices]
+            # Encode only the selected attention frames so max_analysis_frames reduces vision memory too.
+            attention_frames = [frames[frame_idx] for frame_idx in attention_frame_indices]
+            attention_embeds, attention_grid = self.encode_vision(attention_frames)
+            attention_frame_token_counts = frame_token_counts_from_grid(attention_grid, self.merge_size)
             for row in frame_rows:
                 row["used_for_attention"] = bool(int(row["frame_index"]) in attention_index_lookup)
 
