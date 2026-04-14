@@ -652,10 +652,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         return record, (example_payload if save_example_matrices or save_raw_attentions else None)
 
 
-def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metrics: bool = False) -> dict[str, Any]:
+    scalar_metric_names = ["siglip_similarity"]
+    attention_metric_names = ["question_prefill_attention", "first_token_attention"]
     valid_records = [record for record in records if not record.get("error")]
     summary: dict[str, Any] = {
-        "config": config,
         "total_records": len(records),
         "valid_records": len(valid_records),
         "error_records": len(records) - len(valid_records),
@@ -663,64 +664,156 @@ def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, An
         "tasks": {},
     }
 
+    def summarize_metrics(metric_records: list[dict[str, Any]]) -> dict[str, Any]:
+        metrics_summary: dict[str, Any] = {}
+
+        for name in scalar_metric_names:
+            values = [record["metrics"][name] for record in metric_records if name in record.get("metrics", {})]
+            if values:
+                metrics_summary[name] = {
+                    "count": len(values),
+                    "recent4_mean_percentile_mean": float(
+                        np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
+                    ),
+                    "recent4_top4_overlap_mean": float(
+                        np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
+                    ),
+                }
+
+        for name in attention_metric_names:
+            values = [record["metrics"][name] for record in metric_records if name in record.get("metrics", {})]
+            if values:
+                layer_recent_rows: list[np.ndarray] = []
+                layer_overlap_rows: list[np.ndarray] = []
+                display_layer_indices: list[int] = []
+                num_layers_total: int | None = None
+                for item in values:
+                    recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile")
+                    overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap")
+                    if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
+                        continue
+                    if display_layer_indices and recent_indices != display_layer_indices:
+                        continue
+                    if not display_layer_indices:
+                        display_layer_indices = list(recent_indices)
+                    layer_recent_rows.append(recent_row)
+                    layer_overlap_rows.append(overlap_row)
+                    if num_layers_total is None and item.get("num_layers_total") is not None:
+                        num_layers_total = int(item["num_layers_total"])
+
+                summary_payload = {
+                    "count": len(values),
+                    "recent4_mean_percentile_mean": float(
+                        np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
+                    ),
+                    "recent4_top4_overlap_mean": float(
+                        np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
+                    ),
+                }
+                if layer_recent_rows and layer_overlap_rows:
+                    summary_payload["display_layer_indices"] = display_layer_indices
+                    summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
+                if num_layers_total is not None:
+                    summary_payload["num_layers_total"] = num_layers_total
+                metrics_summary[name] = summary_payload
+
+        return metrics_summary
+
+    def summarize_task_mean_metrics(task_summaries: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        task_mean_metrics: dict[str, Any] = {}
+
+        for name in scalar_metric_names:
+            values = [
+                task_summary["metrics"][name]
+                for task_summary in task_summaries.values()
+                if name in task_summary.get("metrics", {})
+            ]
+            if values:
+                task_mean_metrics[name] = {
+                    "task_count": len(values),
+                    "recent4_mean_percentile_mean": float(
+                        np.mean([item["recent4_mean_percentile_mean"] for item in values], dtype=np.float64)
+                    ),
+                    "recent4_top4_overlap_mean": float(
+                        np.mean([item["recent4_top4_overlap_mean"] for item in values], dtype=np.float64)
+                    ),
+                }
+
+        for name in attention_metric_names:
+            values = [
+                task_summary["metrics"][name]
+                for task_summary in task_summaries.values()
+                if name in task_summary.get("metrics", {})
+            ]
+            if values:
+                layer_recent_rows: list[np.ndarray] = []
+                layer_overlap_rows: list[np.ndarray] = []
+                display_layer_indices: list[int] = []
+                num_layers_total: int | None = None
+                for item in values:
+                    recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile_mean")
+                    overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap_mean")
+                    if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
+                        continue
+                    if display_layer_indices and recent_indices != display_layer_indices:
+                        continue
+                    if not display_layer_indices:
+                        display_layer_indices = list(recent_indices)
+                    layer_recent_rows.append(recent_row)
+                    layer_overlap_rows.append(overlap_row)
+                    if num_layers_total is None and item.get("num_layers_total") is not None:
+                        num_layers_total = int(item["num_layers_total"])
+
+                summary_payload = {
+                    "task_count": len(values),
+                    "recent4_mean_percentile_mean": float(
+                        np.mean([item["recent4_mean_percentile_mean"] for item in values], dtype=np.float64)
+                    ),
+                    "recent4_top4_overlap_mean": float(
+                        np.mean([item["recent4_top4_overlap_mean"] for item in values], dtype=np.float64)
+                    ),
+                }
+                if layer_recent_rows and layer_overlap_rows:
+                    summary_payload["display_layer_indices"] = display_layer_indices
+                    summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
+                if num_layers_total is not None:
+                    summary_payload["num_layers_total"] = num_layers_total
+                task_mean_metrics[name] = summary_payload
+
+        return task_mean_metrics
+
     task_groups: dict[str, list[dict[str, Any]]] = {}
     for record in valid_records:
         task_groups.setdefault(str(record.get("task", "unknown")), []).append(record)
+
+    task_summaries: dict[str, dict[str, Any]] = {}
     for task, task_records in sorted(task_groups.items()):
-        summary["tasks"][task] = {"count": len(task_records)}
+        task_payload: dict[str, Any] = {"count": len(task_records)}
+        task_metrics = summarize_metrics(task_records)
+        if task_metrics:
+            task_payload["metrics"] = task_metrics
+        task_summaries[task] = task_payload
+    summary["tasks"] = task_summaries
 
-    scalar_metric_names = ["siglip_similarity"]
-    attention_metric_names = ["question_prefill_attention", "first_token_attention"]
+    summary["metrics"] = summarize_metrics(valid_records)
+    if include_task_mean_metrics and task_summaries:
+        summary["task_mean_metrics"] = summarize_task_mean_metrics(task_summaries)
 
-    for name in scalar_metric_names:
-        values = [record["metrics"][name] for record in valid_records if name in record.get("metrics", {})]
-        if values:
-            summary["metrics"][name] = {
-                "count": len(values),
-                "recent4_mean_percentile_mean": float(
-                    np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
-                ),
-                "recent4_top4_overlap_mean": float(
-                    np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
-                ),
-            }
+    return summary
 
-    for name in attention_metric_names:
-        values = [record["metrics"][name] for record in valid_records if name in record.get("metrics", {})]
-        if values:
-            layer_recent_rows: list[np.ndarray] = []
-            layer_overlap_rows: list[np.ndarray] = []
-            display_layer_indices: list[int] = []
-            num_layers_total: int | None = None
-            for item in values:
-                recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile")
-                overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap")
-                if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
-                    continue
-                if display_layer_indices and recent_indices != display_layer_indices:
-                    continue
-                if not display_layer_indices:
-                    display_layer_indices = list(recent_indices)
-                layer_recent_rows.append(recent_row)
-                layer_overlap_rows.append(overlap_row)
-                if num_layers_total is None and item.get("num_layers_total") is not None:
-                    num_layers_total = int(item["num_layers_total"])
 
-            summary_payload = {
-                "count": len(values),
-                "recent4_mean_percentile_mean": float(
-                    np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
-                ),
-                "recent4_top4_overlap_mean": float(
-                    np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
-                ),
-            }
-            if layer_recent_rows and layer_overlap_rows:
-                summary_payload["display_layer_indices"] = display_layer_indices
-                summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
-                summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
-            if num_layers_total is not None:
-                summary_payload["num_layers_total"] = num_layers_total
-            summary["metrics"][name] = summary_payload
-
+def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "config": config,
+        **summarize_record_slice(records),
+    }
+    summary["splits"] = {
+        split_name: summarize_record_slice(
+            [record for record in records if str(record.get("split", "")) == split_name],
+            include_task_mean_metrics=True,
+        )
+        for split_name in ("backward", "realtime")
+    }
     return summary

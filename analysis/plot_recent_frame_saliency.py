@@ -35,6 +35,10 @@ def valid_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in records if not record.get("error")]
 
 
+def records_for_split(records: list[dict[str, Any]], split_name: str) -> list[dict[str, Any]]:
+    return [record for record in records if str(record.get("split", "")) == split_name]
+
+
 def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: str) -> list[float]:
     values: list[float] = []
     for record in valid_records(records):
@@ -390,10 +394,8 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
         plt.close(fig)
 
 
-def generate_plots(result_dir: str | Path) -> None:
-    result_dir = Path(result_dir)
-    records = load_jsonl(result_dir / "records.jsonl")
-    plots_dir = ensure_dir(result_dir / "plots")
+def generate_aggregate_plots(records: list[dict[str, Any]], plots_dir: Path) -> None:
+    plots_dir = ensure_dir(plots_dir)
     if not records:
         return
 
@@ -403,10 +405,22 @@ def generate_plots(result_dir: str | Path) -> None:
     plot_layer_lines(records, plots_dir)
     plot_layer_heatmaps(records, plots_dir)
 
+
+def generate_plots(result_dir: str | Path) -> None:
+    result_dir = Path(result_dir)
+    records = load_jsonl(result_dir / "records.jsonl")
+    plots_dir = result_dir / "plots"
+    if not records:
+        return
+
+    generate_aggregate_plots(records, plots_dir)
+    for split_name in ("backward", "realtime"):
+        generate_aggregate_plots(records_for_split(records, split_name), plots_dir / split_name)
+
     examples_dir = result_dir / "examples"
     if examples_dir.exists():
         for example_path in sorted(examples_dir.glob("*.pt")):
-            plot_example_payload(example_path, plots_dir)
+            plot_example_payload(example_path, ensure_dir(plots_dir))
 
 
 def main() -> None:
