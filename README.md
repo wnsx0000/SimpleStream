@@ -39,16 +39,21 @@ A sliding-window baseline that feeds only the most recent ***N*** frames to an o
 ### Environment Setup
 
 ```bash
-conda create -n simplestream python=3.10 -y
-conda activate simplestream
+conda create -n SimpleStream python=3.10 -y
+conda activate SimpleStream
+pip install -r requirements.txt
 
 # for my environment
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 
-pip install -r requirements.txt
 # Optional: faster attention backend
 pip install flash-attn --no-build-isolation
 ```
+
+Qwen3-VL experiments require `transformers>=4.57.0` because the
+`transformers.models.qwen3_vl` module is not available in older releases such
+as `4.45.0`.
 
 ### Models
 
@@ -97,6 +102,22 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes=2 \
     --recent_frames_only 8 \
     --chunk_duration 1.0 \
     --fps 1.0
+```
+</details>
+
+<details>
+<summary><b>Qwen2.5-VL on OVO-Bench with no acceleration (auto device)</b></summary>
+
+``` bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_recent8_auto \
+    --recent_frames_only 8 \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --model_device auto
 ```
 </details>
 

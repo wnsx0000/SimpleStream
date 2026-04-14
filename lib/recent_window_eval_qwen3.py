@@ -28,6 +28,7 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
             max_new_tokens=max_new_tokens,
             attn_implementation=attn_implementation,
         )
+        self._use_cached_vision_path = True
         self.vision_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
         self.vision_end_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
         self.im_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -37,6 +38,8 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
     @torch.inference_mode()
     def encode_vision(self, frames: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
         """Keep official preprocessing, but expose encoded vision for explicit input building."""
+        visual_device = self._get_visual_device()
+
         content = [{"type": "image", "image": frame} for frame in frames]
         content.append({"type": "text", "text": "."})
         messages = [{"role": "user", "content": content}]
@@ -49,8 +52,8 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
             return_tensors="pt",
         )
 
-        pixel_values = inputs["pixel_values"].to(self.model.device, dtype=self._get_visual_dtype())
-        image_grid_thw = inputs["image_grid_thw"].to(self.model.device)
+        pixel_values = inputs["pixel_values"].to(visual_device, dtype=self._get_visual_dtype())
+        image_grid_thw = inputs["image_grid_thw"].to(visual_device)
         image_embeds = self._flatten_vision_features(
             self._get_image_feature_model().get_image_features(pixel_values, image_grid_thw)
         )
@@ -67,16 +70,16 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
         cached_grid_thw: torch.Tensor,
         question: str,
     ) -> str:
-        device = self.model.device
         tokenizer = self.processor.tokenizer
         text_model = self._get_text_model()
+        text_device = self._get_text_input_device()
 
         num_vision_tokens = int(cached_embeds.shape[0])
         self._last_num_vision_tokens = num_vision_tokens
         self._last_num_vision_frames = int(cached_grid_thw.shape[0]) if cached_grid_thw is not None else 0
 
         question_ids = tokenizer.encode(question, add_special_tokens=False)
-        grid_rows = cached_grid_thw.to(device)
+        grid_rows = cached_grid_thw.to(text_device)
 
         input_ids_list: list[int] = []
         input_ids_list.extend([self.im_start_id])
@@ -91,7 +94,7 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
         input_ids_list.extend([self.im_start_id])
         input_ids_list.extend(tokenizer.encode("assistant\n", add_special_tokens=False))
 
-        input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=device)
+        input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=text_device)
         attention_mask = torch.ones_like(input_ids)
 
         inputs_embeds = text_model.get_input_embeddings()(input_ids)
@@ -116,5 +119,16 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
 
     @torch.inference_mode()
     def generate_from_frames(self, frames: list[Image.Image], question: str) -> str:
-        cached_embeds, cached_grid_thw = self.encode_vision(frames)
-        return self.generate_with_cached_vision(cached_embeds, cached_grid_thw, question)
+        if not self._use_cached_vision_path:
+            return super().generate_from_frames(frames, question)
+
+        try:
+            cached_embeds, cached_grid_thw = self.encode_vision(frames)
+            return self.generate_with_cached_vision(cached_embeds, cached_grid_thw, question)
+        except RuntimeError as exc:
+            if "v must have shape (total_k, num_heads_k, head_size)" not in str(exc):
+                raise
+            self._use_cached_vision_path = False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return super().generate_from_frames(frames, question)

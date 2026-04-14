@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import re
@@ -78,9 +79,21 @@ class RecentWindowQAModel:
         from transformers import AutoProcessor
 
         if "qwen3" in model_name.lower():
-            from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-                Qwen3VLForConditionalGeneration as _ModelClass,
-            )
+            try:
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                    Qwen3VLForConditionalGeneration as _ModelClass,
+                )
+            except ModuleNotFoundError as exc:
+                if exc.name == "transformers.models.qwen3_vl":
+                    import transformers
+
+                    raise ImportError(
+                        "Qwen3-VL support is not available in the installed transformers package. "
+                        "This code path requires transformers>=4.57.0, "
+                        f"but the current environment reports transformers=={getattr(transformers, '__version__', 'unknown')}. "
+                        "Upgrade the runtime environment and reinstall the requirements."
+                    ) from exc
+                raise
         else:
             from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
                 Qwen2_5_VLForConditionalGeneration as _ModelClass,
@@ -118,15 +131,11 @@ class RecentWindowQAModel:
 
         self.model.eval()
 
-        _hf_model = (
-            self.model.get_base_model()
-            if hasattr(self.model, "get_base_model")
-            else self.model
-        )
+        _hf_model = getattr(self.model, "base_model", getattr(self.model, "model", self.model))
         self._hf_model = _hf_model
         self.image_token_id = _hf_model.config.image_token_id
         self._visual = _hf_model.visual
-        self._text_model = _hf_model.model
+        self._text_model = _hf_model
         self.merge_size = getattr(self._visual, "spatial_merge_size", 1)
 
         tokenizer = self.processor.tokenizer
@@ -138,7 +147,7 @@ class RecentWindowQAModel:
     def _get_hf_model(self):
         if hasattr(self, "_hf_model"):
             return self._hf_model
-        return self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        return getattr(self.model, "base_model", getattr(self.model, "model", self.model))
 
     def _get_visual_module(self):
         if hasattr(self, "_visual"):
@@ -151,8 +160,7 @@ class RecentWindowQAModel:
     def _get_text_model(self):
         if hasattr(self, "_text_model"):
             return self._text_model
-        hf_model = self._get_hf_model()
-        return hf_model.model if hasattr(hf_model, "model") else hf_model
+        return self._get_hf_model()
 
     def _get_image_feature_model(self):
         hf_model = self._get_hf_model()
@@ -171,6 +179,11 @@ class RecentWindowQAModel:
     def _flatten_vision_features(self, features: Any) -> torch.Tensor:
         if isinstance(features, torch.Tensor):
             return features
+        for attr in ("pooler_output", "last_hidden_state"):
+            if hasattr(features, attr):
+                value = getattr(features, attr)
+                if value is not None:
+                    return self._flatten_vision_features(value)
         if isinstance(features, (tuple, list)):
             if features and all(isinstance(item, torch.Tensor) for item in features):
                 return torch.cat(list(features), dim=0)
@@ -420,12 +433,32 @@ def decode_video_to_chunks_qwen(
             return_video_metadata=True,
         )
     else:
-        video, metadata = fetch_video(video_req, return_video_metadata=True)
+        fetch_signature = inspect.signature(fetch_video)
+        if "return_video_metadata" in fetch_signature.parameters:
+            video, metadata = fetch_video(video_req, return_video_metadata=True)
+        else:
+            video, sampled_fps = fetch_video(video_req, return_video_sample_fps=True)
+            start_ts = max(0.0, float(video_start or 0.0))
+            sampled_fps = max(float(sampled_fps), 1e-6)
+            metadata = {
+                "fps": sampled_fps,
+                "frame_timestamps": [start_ts + (i / sampled_fps) for i in range(int(video.shape[0]))],
+                "video_backend": "qwen_vl_utils_legacy",
+            }
 
     if not isinstance(video, torch.Tensor) or video.ndim != 4:
         raise ValueError(f"Unexpected qwen_vl_utils output for video={video_path!r}")
 
     meta = metadata if isinstance(metadata, dict) else {}
+    frame_timestamps = meta.get("frame_timestamps")
+    if isinstance(frame_timestamps, torch.Tensor):
+        frame_timestamps = frame_timestamps.detach().cpu().reshape(-1).tolist()
+    elif frame_timestamps is not None and not isinstance(frame_timestamps, (list, tuple)):
+        try:
+            frame_timestamps = list(frame_timestamps)
+        except TypeError:
+            frame_timestamps = None
+
     raw_fps = max(float(meta.get("fps", fps if fps > 0 else 1.0)), 1e-6)
     frame_indices = meta.get("frames_indices")
     if isinstance(frame_indices, torch.Tensor):
@@ -435,30 +468,35 @@ def decode_video_to_chunks_qwen(
             frame_indices = list(frame_indices)
         except TypeError:
             frame_indices = None
-    if frame_indices is None or len(frame_indices) != int(video.shape[0]):
-        start_frame = int(max(0.0, float(video_start or 0.0)) * raw_fps)
-        frame_indices = [start_frame + i for i in range(int(video.shape[0]))]
-    frame_indices = [int(x) for x in frame_indices]
 
-    if len(frame_indices) > 1:
-        sampled_duration = float(frame_indices[-1] - frame_indices[0]) / raw_fps
-        sampled_fps = float(len(frame_indices) - 1) / max(sampled_duration, 1e-6)
+    timestamps: list[float]
+    if frame_timestamps is not None and len(frame_timestamps) == int(video.shape[0]):
+        timestamps = [float(x) for x in frame_timestamps]
     else:
-        sampled_fps = max(float(fps), 1e-6)
+        if frame_indices is None or len(frame_indices) != int(video.shape[0]):
+            start_frame = int(max(0.0, float(video_start or 0.0)) * raw_fps)
+            frame_indices = [start_frame + i for i in range(int(video.shape[0]))]
+        frame_indices = [int(x) for x in frame_indices]
+        timestamps = [float(idx) / raw_fps for idx in frame_indices]
+
+    if len(timestamps) > 1:
+        sampled_duration = timestamps[-1] - timestamps[0]
+        sampled_fps = float(len(timestamps) - 1) / max(sampled_duration, 1e-6)
+    else:
+        sampled_fps = max(float(meta.get("fps", fps if fps > 0 else 1.0)), 1e-6)
     decode_backend = str(meta.get("video_backend", "unknown"))
     if video_start is not None or video_end is not None:
         decode_backend = f"{decode_backend}_window"
 
-    max_ts = max((float(idx) / raw_fps for idx in frame_indices), default=0.0)
-    if len(frame_indices) > 1:
-        frame_dt = max(float(frame_indices[-1] - frame_indices[-2]) / raw_fps, 1.0 / raw_fps)
+    max_ts = max(timestamps, default=0.0)
+    if len(timestamps) > 1:
+        frame_dt = max(timestamps[-1] - timestamps[-2], 1.0 / max(sampled_fps, 1e-6))
     else:
-        frame_dt = 1.0 / raw_fps
+        frame_dt = 1.0 / max(sampled_fps, 1e-6)
     max_valid_end = max_ts + frame_dt
 
     frame_buckets: dict[int, list[tuple[Image.Image, float]]] = {}
-    for i, frame_idx in enumerate(frame_indices):
-        ts = float(frame_idx) / raw_fps
+    for i, ts in enumerate(timestamps):
         chunk_idx = int(ts // chunk_duration)
         frame = video[i].clamp(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
         frame_buckets.setdefault(chunk_idx, []).append((Image.fromarray(frame), ts))

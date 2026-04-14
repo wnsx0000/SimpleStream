@@ -159,6 +159,16 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max_qa_tokens", type=int, default=256)
     parser.add_argument(
+        "--model_device",
+        choices=["local_process", "auto"],
+        default="local_process",
+        help=(
+            "Model placement mode. "
+            "'local_process' keeps one full model replica per accelerate process. "
+            "'auto' uses Hugging Face device_map='auto' and requires --num_processes=1."
+        ),
+    )
+    parser.add_argument(
         "--max_samples_per_split",
         type=int,
         default=None,
@@ -186,6 +196,9 @@ def main() -> None:
         realtime_anno = realtime_anno[: args.max_samples_per_split]
         forward_anno = forward_anno[: args.max_samples_per_split]
 
+    if args.model_device == "auto" and accelerator.num_processes != 1:
+        raise ValueError("--model_device=auto requires accelerate --num_processes=1.")
+
     accelerator.print(f"\n{'=' * 60}")
     accelerator.print(f"OVO-Bench Recent-Window Evaluation ({MODEL_LABEL})")
     accelerator.print(f"{'=' * 60}")
@@ -201,7 +214,7 @@ def main() -> None:
 
     evaluator = RecentWindowQAModel(
         model_name=args.model_path,
-        device=accelerator.device,
+        device="auto" if args.model_device == "auto" else accelerator.device,
         max_new_tokens=args.max_qa_tokens,
     )
 

@@ -1,6 +1,8 @@
 # Core dependencies for simpleStream experiments
 torch>=2.1.0
-transformers>=4.45.0
+# Qwen3-VL model output includes attention map from version 5.0.0
+transformers==5.0.0
+# transformers>=4.57.0
 accelerate>=0.25.0
 
 # Video processing
@@ -10,9 +12,11 @@ qwen-vl-utils<0.0.12
 
 # Vision & utilities
 Pillow>=10.0.0
-numpy==1.24.0
+numpy>=1.24.0
 tqdm>=4.65.0
 torchvision>=0.16.0
+
+# Plotting
 matplotlib>=3.8.0
 
 # Optional: flash attention (recommended for speed)
