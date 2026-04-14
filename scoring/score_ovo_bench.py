@@ -83,6 +83,7 @@ class OVOBenchOfflineScore:
         forward_results = self.results["forward"]
         avg_scores = {"backward": [], "realtime": [], "forward": []}
         backward_score = realtime_score = forward_score = 0.0
+        category_scores = []
 
         if len(backward_results) > 0:
             print("Evaluate Backward Tracing...")
@@ -91,6 +92,7 @@ class OVOBenchOfflineScore:
                 print(f"Task: {k}, Acc: {100 * sum(v)/len(v):.2f}")
                 avg_scores["backward"].append(sum(v)/len(v))
             backward_score = 100 * sum(avg_scores['backward'])/len(avg_scores['backward'])
+            category_scores.append(backward_score)
             print(f"Backward Avg.: {backward_score:.2f}\n")
 
         if len(realtime_results) > 0:
@@ -100,6 +102,7 @@ class OVOBenchOfflineScore:
                 print(f"Task: {k}, Acc: {100 * sum(v)/len(v):.2f}")
                 avg_scores["realtime"].append(sum(v)/len(v))
             realtime_score = 100 * sum(avg_scores['realtime'])/len(avg_scores['realtime'])
+            category_scores.append(realtime_score)
             print(f"Realtime Avg.: {realtime_score:.2f}\n")
 
         if len(forward_results) > 0:
@@ -109,9 +112,11 @@ class OVOBenchOfflineScore:
                 print(f"Task: {k}, Acc: {100 * sum(v)/len(v):.2f}")
                 avg_scores["forward"].append(sum(v)/len(v))
             forward_score = 100 * sum(avg_scores['forward'])/len(avg_scores['forward'])
+            category_scores.append(forward_score)
             print(f"Forward Avg.: {forward_score:.2f}\n")
 
-        print(f"Total Avg.: {(backward_score + realtime_score + forward_score) / 3:.2f}")
+        total_avg = sum(category_scores) / len(category_scores) if category_scores else 0.0
+        print(f"Total Avg.: {total_avg:.2f}")
 
 
 # ---------------------------------------------------------------------------
