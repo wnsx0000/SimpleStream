@@ -106,7 +106,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes=2 \
 </details>
 
 <details>
-<summary><b>Qwen2.5-VL on OVO-Bench with no acceleration (auto device)</b></summary>
+<summary><b>Qwen3-VL on OVO-Bench with no acceleration (auto device)</b></summary>
 
 ``` bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo.py \
@@ -166,7 +166,7 @@ python scoring/score_ovo_bench.py \
 <details>
 <summary><b>Saliency Test</b></summary>
 
-Measures whether the `recent4` frames selected by SimpleStream are also salient
+Measures whether the `recent4` frames selected by SimpleStream are also salient 
 among all sampled frames in the same window for the OVO-Bench backward and
 realtime splits. The script computes:
 - SigLIP-SO400M frame-question similarity

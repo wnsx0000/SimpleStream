@@ -1,8 +1,10 @@
 """
-OVO-Bench recent-window evaluation for Qwen3-VL.
+OVO-Bench full-frame evaluation for Qwen3-VL.
 
-Aligned with internal eval_recent_frames_ovo.py:
-decode video -> chunk by time -> keep the last N chunks -> generate_from_frames
+Unlike eval_qwen3vl_ovo.py which uses only the last N recent chunks,
+this script uses ALL available frames (up to --max_frames), uniformly
+sampling non-recent frames when the total exceeds the cap while always
+including recent frames.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from lib.recent_window_eval_qwen3 import (
     print_ovo_results,
 )
 
-MODEL_LABEL = "Qwen3-VL"
+MODEL_LABEL = "Qwen3-VL-FullFrame"
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
@@ -149,12 +151,13 @@ def wait_for_done_markers(result_dir: str, num_processes: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OVO-Bench recent-window evaluation for Qwen3-VL")
+    parser = argparse.ArgumentParser(description="OVO-Bench full-frame evaluation for Qwen3-VL")
     parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
     parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
-    parser.add_argument("--result_dir", default="results/ovo_bench_recent_window_qwen3vl")
+    parser.add_argument("--result_dir", default="results/ovo_bench_full_frame_qwen3vl")
     parser.add_argument("--recent_frames_only", type=int, default=4)
+    parser.add_argument("--max_frames", type=int, default=32, help="Maximum number of frames to use per video. Recent frames are always included; remaining budget is filled uniformly.")
     parser.add_argument("--chunk_duration", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max_qa_tokens", type=int, default=256)
@@ -200,12 +203,13 @@ def main() -> None:
         raise ValueError("--model_device=auto requires accelerate --num_processes=1.")
 
     accelerator.print(f"\n{'=' * 60}")
-    accelerator.print(f"OVO-Bench Recent-Window Evaluation ({MODEL_LABEL})")
+    accelerator.print(f"OVO-Bench Full-Frame Evaluation ({MODEL_LABEL})")
     accelerator.print(f"{'=' * 60}")
     accelerator.print(f"Backward: {len(backward_anno)}, Realtime: {len(realtime_anno)}, Forward: {len(forward_anno)}")
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
         f"Window: recent_frames_only={args.recent_frames_only}, "
+        f"max_frames={args.max_frames}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
     )
     if args.max_samples_per_split is not None:
@@ -243,6 +247,7 @@ def main() -> None:
                 chunk_duration=args.chunk_duration,
                 fps=args.fps,
                 recent_frames_only=args.recent_frames_only,
+                max_frames=args.max_frames,
             )
             backward_results.append(result)
             done_keys.add(key)
@@ -259,6 +264,7 @@ def main() -> None:
                 chunk_duration=args.chunk_duration,
                 fps=args.fps,
                 recent_frames_only=args.recent_frames_only,
+                max_frames=args.max_frames,
             )
             realtime_results.append(result)
             done_keys.add(key)
@@ -275,6 +281,7 @@ def main() -> None:
                 chunk_duration=args.chunk_duration,
                 fps=args.fps,
                 recent_frames_only=args.recent_frames_only,
+                max_frames=args.max_frames,
             )
             forward_results.append(result)
             done_keys.add(key)
@@ -288,13 +295,14 @@ def main() -> None:
         print_ovo_results(MODEL_LABEL, all_backward, all_realtime, all_forward)
         os.makedirs(args.result_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(args.result_dir, f"qwen3vl_results_{timestamp}.json")
+        output_path = os.path.join(args.result_dir, f"qwen3vl_full_frame_results_{timestamp}.json")
         with open(output_path, "w") as handle:
             json.dump(
                 {
                     "config": {
                         "model_path": args.model_path,
                         "recent_frames_only": args.recent_frames_only,
+                        "max_frames": args.max_frames,
                         "chunk_duration": args.chunk_duration,
                         "fps": args.fps,
                         "max_samples_per_split": args.max_samples_per_split,

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -518,6 +519,35 @@ def decode_video_to_chunks_qwen(
     return chunks, decode_backend
 
 
+def evenly_spaced_indices(items: list[int], target_count: int) -> list[int]:
+    if target_count <= 0 or not items:
+        return []
+    if target_count >= len(items):
+        return list(items)
+    positions = np.array_split(np.arange(len(items)), target_count)
+    return [int(items[int(chunk[len(chunk) // 2])]) for chunk in positions if len(chunk) > 0]
+
+
+def select_attention_frame_indices(
+    total_frames: int,
+    recent_indices: list[int],
+    max_analysis_frames: int,
+) -> tuple[list[int], str]:
+    if total_frames <= int(max_analysis_frames):
+        return list(range(total_frames)), "all_frames"
+
+    unique_recent = sorted(set(int(index) for index in recent_indices if 0 <= int(index) < total_frames))
+    if len(unique_recent) >= int(max_analysis_frames):
+        selected = evenly_spaced_indices(unique_recent, int(max_analysis_frames))
+        return sorted(selected), "uniform_recent_only"
+
+    remaining_budget = int(max_analysis_frames) - len(unique_recent)
+    candidate_indices = [index for index in range(total_frames) if index not in set(unique_recent)]
+    sampled_context = evenly_spaced_indices(candidate_indices, remaining_budget)
+    selected = sorted(set(unique_recent + sampled_context))
+    return selected, "uniform_with_recent_anchor"
+
+
 def query_recent_window(
     qa: RecentWindowQAModel,
     video_path: str,
@@ -569,6 +599,74 @@ def query_recent_window(
     )
 
 
+def query_full_frame(
+    qa: RecentWindowQAModel,
+    video_path: str,
+    prompt: str,
+    chunk_duration: float,
+    fps: float,
+    recent_frames_only: int,
+    max_frames: int = 32,
+    video_start: float | None = None,
+    video_end: float | None = None,
+) -> tuple[RecentWindowResult, str]:
+    chunks, decode_backend = decode_video_to_chunks_qwen(
+        video_path=video_path,
+        chunk_duration=chunk_duration,
+        fps=fps,
+        recent_frames_only=None,
+        video_start=video_start,
+        video_end=video_end,
+    )
+    if not chunks:
+        raise ValueError(f"No chunks decoded from video: {video_path}")
+
+    window_size = max(1, int(recent_frames_only))
+    recent_chunk_set = set(int(chunk.chunk_index) for chunk in chunks[-window_size:])
+
+    all_frames: list[Image.Image] = []
+    recent_indices: list[int] = []
+    for chunk in chunks:
+        is_recent = int(chunk.chunk_index) in recent_chunk_set
+        for frame in chunk.frames:
+            if is_recent:
+                recent_indices.append(len(all_frames))
+            all_frames.append(frame)
+
+    if len(all_frames) > max_frames:
+        selected_indices, _ = select_attention_frame_indices(
+            total_frames=len(all_frames),
+            recent_indices=recent_indices,
+            max_analysis_frames=max_frames,
+        )
+        final_frames = [all_frames[i] for i in selected_indices]
+    else:
+        final_frames = all_frames
+
+    final_chunk_ids = sorted(recent_chunk_set)
+
+    t0 = time.perf_counter()
+    answer = qa.generate_from_frames(final_frames, prompt)
+    generate_time = time.perf_counter() - t0
+    ttft_seconds = getattr(qa, "_last_ttft_seconds", 0.0) or 0.0
+    num_vision_tokens = qa._last_num_vision_tokens
+    num_frames = qa._last_num_vision_frames
+
+    return (
+        RecentWindowResult(
+            answer=answer,
+            final_chunk_ids=final_chunk_ids,
+            generate_time=generate_time,
+            ttft_seconds=ttft_seconds,
+            num_vision_tokens=num_vision_tokens,
+            num_vision_tokens_before=num_vision_tokens,
+            num_vision_tokens_after=num_vision_tokens,
+            num_frames=num_frames,
+        ),
+        decode_backend,
+    )
+
+
 def evaluate_ovo_backward_realtime(
     anno: dict[str, Any],
     chunked_dir: str,
@@ -576,19 +674,31 @@ def evaluate_ovo_backward_realtime(
     chunk_duration: float,
     fps: float,
     recent_frames_only: int,
+    max_frames: int | None = None,
 ) -> dict[str, Any]:
     video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
     response = None
     metadata: dict[str, Any] = {}
     if os.path.exists(video_path):
-        result, decode_backend = query_recent_window(
-            qa=qa,
-            video_path=video_path,
-            prompt=build_ovo_prompt(anno["task"], anno),
-            chunk_duration=chunk_duration,
-            fps=fps,
-            recent_frames_only=recent_frames_only,
-        )
+        if max_frames is not None:
+            result, decode_backend = query_full_frame(
+                qa=qa,
+                video_path=video_path,
+                prompt=build_ovo_prompt(anno["task"], anno),
+                chunk_duration=chunk_duration,
+                fps=fps,
+                recent_frames_only=recent_frames_only,
+                max_frames=max_frames,
+            )
+        else:
+            result, decode_backend = query_recent_window(
+                qa=qa,
+                video_path=video_path,
+                prompt=build_ovo_prompt(anno["task"], anno),
+                chunk_duration=chunk_duration,
+                fps=fps,
+                recent_frames_only=recent_frames_only,
+            )
         response = result.answer
         metadata = {
             "decode_backend": decode_backend,
@@ -618,6 +728,7 @@ def evaluate_ovo_forward(
     chunk_duration: float,
     fps: float,
     recent_frames_only: int,
+    max_frames: int | None = None,
 ) -> dict[str, Any]:
     result_anno = copy.deepcopy(anno)
     for index, test_info in enumerate(result_anno["test_info"]):
@@ -625,14 +736,25 @@ def evaluate_ovo_forward(
         if not os.path.exists(video_path):
             test_info["response"] = None
             continue
-        result, decode_backend = query_recent_window(
-            qa=qa,
-            video_path=video_path,
-            prompt=build_ovo_prompt(anno["task"], anno, index=index),
-            chunk_duration=chunk_duration,
-            fps=fps,
-            recent_frames_only=recent_frames_only,
-        )
+        if max_frames is not None:
+            result, decode_backend = query_full_frame(
+                qa=qa,
+                video_path=video_path,
+                prompt=build_ovo_prompt(anno["task"], anno, index=index),
+                chunk_duration=chunk_duration,
+                fps=fps,
+                recent_frames_only=recent_frames_only,
+                max_frames=max_frames,
+            )
+        else:
+            result, decode_backend = query_recent_window(
+                qa=qa,
+                video_path=video_path,
+                prompt=build_ovo_prompt(anno["task"], anno, index=index),
+                chunk_duration=chunk_duration,
+                fps=fps,
+                recent_frames_only=recent_frames_only,
+            )
         test_info["response"] = result.answer
         test_info["decode_backend"] = decode_backend
         test_info["final_chunk_ids"] = result.final_chunk_ids

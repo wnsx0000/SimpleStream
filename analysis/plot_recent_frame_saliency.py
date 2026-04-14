@@ -42,7 +42,7 @@ def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: 
         if not metric:
             continue
         if metric_name.endswith("_attention"):
-            frame_values = metric.get("last_k_layers_mean_percentile", [])
+            frame_values = metric.get("mean_percentile", [])
             recent_indices = metric.get("recent_frame_indices_within_attention", [])
         else:
             frame_values = metric.get("frame_percentiles", [])
@@ -181,14 +181,14 @@ def plot_sample_histograms(records: list[dict[str, Any]], plots_dir: Path) -> No
     available = [
         (metric_name, label)
         for metric_name, label in metric_map.items()
-        if metric_recent_sample_scores(records, metric_name, "recent4_mean_percentile" if not metric_name.endswith("_attention") else "last_k_layers_recent4_mean_percentile")
+        if metric_recent_sample_scores(records, metric_name, "recent4_mean_percentile" if not metric_name.endswith("_attention") else "recent4_mean_percentile")
     ]
     if not available:
         return
 
     fig, axes = plt.subplots(len(available), 1, figsize=(10, 3.5 * len(available)), squeeze=False)
     for ax, (metric_name, label) in zip(axes[:, 0], available):
-        field = "recent4_mean_percentile" if not metric_name.endswith("_attention") else "last_k_layers_recent4_mean_percentile"
+        field = "recent4_mean_percentile" if not metric_name.endswith("_attention") else "recent4_mean_percentile"
         values = metric_recent_sample_scores(records, metric_name, field)
         ax.hist(values, bins=15, range=(0.0, 1.0), alpha=0.8)
         ax.set_xlim(0.0, 1.0)
@@ -203,8 +203,8 @@ def plot_sample_histograms(records: list[dict[str, Any]], plots_dir: Path) -> No
 def plot_overlap_bars(records: list[dict[str, Any]], plots_dir: Path) -> None:
     metric_map = {
         "siglip_similarity": ("SigLIP Frame-Question Similarity", "recent4_top4_overlap"),
-        "question_prefill_attention": ("Question Prefill Attn", "last_k_layers_recent4_top4_overlap"),
-        "first_token_attention": ("First Token Attn", "last_k_layers_recent4_top4_overlap"),
+        "question_prefill_attention": ("Question Prefill Attn", "recent4_top4_overlap"),
+        "first_token_attention": ("First Token Attn", "recent4_top4_overlap"),
     }
     labels = []
     values = []
@@ -322,13 +322,13 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
         attn_x = np.asarray(
             metrics["question_prefill_attention"].get(
                 "attention_frame_indices",
-                list(range(len(metrics["question_prefill_attention"]["last_k_layers_mean_attention_score"]))),
+                list(range(len(metrics["question_prefill_attention"]["mean_attention_score"]))),
             ),
             dtype=np.int64,
         )
         ax.plot(
             attn_x,
-            metrics["question_prefill_attention"]["last_k_layers_mean_attention_score"],
+            metrics["question_prefill_attention"]["mean_attention_score"],
             label="Question Prefill Attn",
         )
         line_plotted = True
@@ -336,13 +336,13 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
         attn_x = np.asarray(
             metrics["first_token_attention"].get(
                 "attention_frame_indices",
-                list(range(len(metrics["first_token_attention"]["last_k_layers_mean_attention_score"]))),
+                list(range(len(metrics["first_token_attention"]["mean_attention_score"]))),
             ),
             dtype=np.int64,
         )
         ax.plot(
             attn_x,
-            metrics["first_token_attention"]["last_k_layers_mean_attention_score"],
+            metrics["first_token_attention"]["mean_attention_score"],
             label="First Token Attn",
         )
         line_plotted = True

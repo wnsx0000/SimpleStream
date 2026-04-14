@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from lib.recent_window_eval import decode_video_to_chunks_qwen
+from lib.recent_window_eval import decode_video_to_chunks_qwen, evenly_spaced_indices, select_attention_frame_indices
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
 DISPLAY_LAYER_COUNT = 5
@@ -103,7 +103,7 @@ def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_C
     return [int(chunk[len(chunk) // 2]) for chunk in bins if len(chunk) > 0]
 
 
-def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[int], last_k_layers: int) -> dict[str, Any]:
+def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[int]) -> dict[str, Any]:
     if layer_scores.ndim != 2:
         raise ValueError(f"Expected [layers, frames] scores, got shape={tuple(layer_scores.shape)}")
 
@@ -112,23 +112,20 @@ def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[
         [tie_aware_percentiles(row.tolist()) for row in layer_scores],
         dtype=torch.float32,
     )
-    layer_recent_mean = [
-        float(layer_percentiles[layer_idx, recent_indices].mean().item()) if recent_indices else 0.0
-        for layer_idx in range(layer_percentiles.shape[0])
-    ]
-    layer_overlap = [
-        topk_overlap(layer_scores[layer_idx].tolist(), recent_indices, top_k=len(recent_indices))
-        for layer_idx in range(layer_scores.shape[0])
-    ]
-
-    last_k = max(1, min(int(last_k_layers), int(layer_scores.shape[0])))
-    last_k_mean_scores = layer_scores[-last_k:].mean(dim=0)
-    last_k_summary = summarize_scalar_metric(last_k_mean_scores.tolist(), recent_indices)
     display_layer_indices = uniform_center_indices(layer_scores.shape[0], DISPLAY_LAYER_COUNT)
     display_layer_scores = layer_scores[display_layer_indices]
     display_layer_percentiles = layer_percentiles[display_layer_indices]
-    display_layer_recent_mean = [layer_recent_mean[index] for index in display_layer_indices]
-    display_layer_overlap = [layer_overlap[index] for index in display_layer_indices]
+    display_layer_recent_mean = [
+        float(layer_percentiles[idx, recent_indices].mean().item()) if recent_indices else 0.0
+        for idx in display_layer_indices
+    ]
+    display_layer_overlap = [
+        topk_overlap(layer_scores[idx].tolist(), recent_indices, top_k=len(recent_indices))
+        for idx in display_layer_indices
+    ]
+
+    mean_scores = layer_scores.mean(dim=0)
+    mean_summary = summarize_scalar_metric(mean_scores.tolist(), recent_indices)
 
     return {
         "num_layers_total": int(layer_scores.shape[0]),
@@ -137,11 +134,10 @@ def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[
         "layer_attention_percentiles": display_layer_percentiles.tolist(),
         "layer_recent4_mean_percentile": [float(value) for value in display_layer_recent_mean],
         "layer_recent4_top4_overlap": [float(value) for value in display_layer_overlap],
-        "last_k_layers_used": last_k,
-        "last_k_layers_mean_attention_score": last_k_summary["frame_scores"],
-        "last_k_layers_mean_percentile": last_k_summary["frame_percentiles"],
-        "last_k_layers_recent4_mean_percentile": last_k_summary["recent4_mean_percentile"],
-        "last_k_layers_recent4_top4_overlap": last_k_summary["recent4_top4_overlap"],
+        "mean_attention_score": mean_summary["frame_scores"],
+        "mean_percentile": mean_summary["frame_percentiles"],
+        "recent4_mean_percentile": mean_summary["recent4_mean_percentile"],
+        "recent4_top4_overlap": mean_summary["recent4_top4_overlap"],
     }
 
 
@@ -183,35 +179,6 @@ def frame_token_counts_from_grid(grid_thw: torch.Tensor, merge_size: int) -> lis
             raise ValueError(f"Invalid frame token count from grid row={row.tolist()} merge_size={merge_size}")
         counts.append(count)
     return counts
-
-
-def evenly_spaced_indices(items: list[int], target_count: int) -> list[int]:
-    if target_count <= 0 or not items:
-        return []
-    if target_count >= len(items):
-        return list(items)
-    positions = np.array_split(np.arange(len(items)), target_count)
-    return [int(items[int(chunk[len(chunk) // 2])]) for chunk in positions if len(chunk) > 0]
-
-
-def select_attention_frame_indices(
-    total_frames: int,
-    recent_indices: list[int],
-    max_analysis_frames: int,
-) -> tuple[list[int], str]:
-    if total_frames <= int(max_analysis_frames):
-        return list(range(total_frames)), "all_frames"
-
-    unique_recent = sorted(set(int(index) for index in recent_indices if 0 <= int(index) < total_frames))
-    if len(unique_recent) >= int(max_analysis_frames):
-        selected = evenly_spaced_indices(unique_recent, int(max_analysis_frames))
-        return sorted(selected), "uniform_recent_only"
-
-    remaining_budget = int(max_analysis_frames) - len(unique_recent)
-    candidate_indices = [index for index in range(total_frames) if index not in set(unique_recent)]
-    sampled_context = evenly_spaced_indices(candidate_indices, remaining_budget)
-    selected = sorted(set(unique_recent + sampled_context))
-    return selected, "uniform_with_recent_anchor"
 
 
 def flatten_chunks(
@@ -499,7 +466,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         recent_frames_only: int,
         similarity_backends: list[str],
         attention_modes: list[str],
-        attention_last_k_layers: int,
         max_analysis_frames: int,
         save_example_matrices: bool = False,
         save_raw_attentions: bool = False,
@@ -587,7 +553,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
                     prefill_scores,
                     recent_indices=attention_recent_indices,
-                    last_k_layers=attention_last_k_layers,
                 )
                 metrics["question_prefill_attention"]["attention_frame_indices"] = attention_frame_indices
                 metrics["question_prefill_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
@@ -629,7 +594,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["first_token_attention"] = summarize_layerwise_metric(
                     decode_scores,
                     recent_indices=attention_recent_indices,
-                    last_k_layers=attention_last_k_layers,
                 )
                 metrics["first_token_attention"]["attention_frame_indices"] = attention_frame_indices
                 metrics["first_token_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
@@ -717,11 +681,11 @@ def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, An
 
             summary_payload = {
                 "count": len(values),
-                "last_k_layers_recent4_mean_percentile_mean": float(
-                    np.mean([item["last_k_layers_recent4_mean_percentile"] for item in values], dtype=np.float64)
+                "recent4_mean_percentile_mean": float(
+                    np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
                 ),
-                "last_k_layers_recent4_top4_overlap_mean": float(
-                    np.mean([item["last_k_layers_recent4_top4_overlap"] for item in values], dtype=np.float64)
+                "recent4_top4_overlap_mean": float(
+                    np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
                 ),
             }
             if layer_recent_rows and layer_overlap_rows:
