@@ -13,7 +13,7 @@ from PIL import Image
 from lib.recent_window_eval import decode_video_to_chunks_qwen, evenly_spaced_indices, select_attention_frame_indices
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
-DISPLAY_LAYER_COUNT = 5
+DISPLAY_LAYER_COUNT = 10
 
 
 def parse_csv_options(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -49,6 +49,11 @@ def save_json(path: str | Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(to_builtin(payload), handle, indent=2, ensure_ascii=False)
+
+
+def release_unused_cuda_memory() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def tie_aware_percentiles(scores: list[float]) -> list[float]:
@@ -296,7 +301,10 @@ class SiglipFrameEncoder:
                 source="image",
             )
             batches.append(F.normalize(features.float(), dim=-1).cpu())
-        return torch.cat(batches, dim=0)
+            del inputs, pixel_values, features
+        frame_features = torch.cat(batches, dim=0)
+        del batches
+        return frame_features
 
     @torch.inference_mode()
     def encode_text(self, text: str) -> torch.Tensor:
@@ -317,7 +325,9 @@ class SiglipFrameEncoder:
             self.model.get_text_features(**text_inputs),
             source="text",
         )
-        return F.normalize(features.float(), dim=-1)[0].cpu()
+        text_feature = F.normalize(features.float(), dim=-1)[0].cpu()
+        del inputs, text_inputs, features
+        return text_feature
 
 
 class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
@@ -418,7 +428,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         cached_embeds = cached_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask = input_ids == self.image_token_id
         inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1).expand_as(inputs_embeds), cached_embeds)
-        position_ids, rope_deltas = text_model.get_rope_index(
+        position_ids, _ = text_model.get_rope_index(
             input_ids=input_ids,
             image_grid_thw=cached_grid_thw.to(text_device),
             video_grid_thw=None,
@@ -426,19 +436,17 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         )
 
         return {
-            "input_ids": input_ids,
             "attention_mask": attention_mask,
             "inputs_embeds": inputs_embeds,
             "position_ids": position_ids,
-            "rope_deltas": rope_deltas,
             "question_token_positions": list(range(question_start, question_end)),
             "frame_token_spans": frame_token_spans,
-            "prompt_length": int(input_ids.shape[1]),
         }
 
     def _run_with_collector(
         self,
         collector: LayerwiseFrameAttentionCollector | None,
+        use_cache: bool = True,
         **model_kwargs: Any,
     ) -> Any:
         handles = []
@@ -447,7 +455,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 handles.append(layer.self_attn.register_forward_hook(collector.make_hook(layer_idx)))
         try:
             return self.model(
-                use_cache=True,
+                use_cache=use_cache,
                 return_dict=True,
                 **model_kwargs,
             )
@@ -482,6 +490,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
 
         # Flatten the chunked output into frame-level structures and collect analysis metadata.
         frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
+        num_sampled_frames = len(frames)
+        del chunks
 
         # Initialize the metric store and the optional example payload scaffold.
         metrics: dict[str, Any] = {}
@@ -502,15 +512,16 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             metrics["siglip_similarity"] = summarize_scalar_metric(siglip_scores, recent_indices)
             if save_example_matrices:
                 example_payload["siglip_similarity_query"] = str(similarity_text or "")
+            del siglip_features, siglip_question_feature, siglip_scores
 
         # Initialize default attention metadata so the output schema stays stable even when skipped.
         attention_skipped_reason: str | None = None
-        attention_frame_indices = list(range(len(frames)))
+        attention_frame_indices = list(range(num_sampled_frames))
         attention_recent_indices: list[int] = recent_indices
         attention_sampling_strategy = "all_frames"
         if attention_modes:
             attention_frame_indices, attention_sampling_strategy = select_attention_frame_indices(
-                total_frames=len(frames),
+                total_frames=num_sampled_frames,
                 recent_indices=recent_indices,
                 max_analysis_frames=max_analysis_frames,
             )
@@ -524,6 +535,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             # Encode only the selected attention frames so max_analysis_frames reduces vision memory too.
             attention_frames = [frames[frame_idx] for frame_idx in attention_frame_indices]
             attention_embeds, attention_grid = self.encode_vision(attention_frames)
+            del attention_frames
             attention_frame_token_counts = frame_token_counts_from_grid(attention_grid, self.merge_size)
             for row in frame_rows:
                 row["used_for_attention"] = bool(int(row["frame_index"]) in attention_index_lookup)
@@ -544,12 +556,14 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 )
                 self._run_with_collector(
                     prefill_collector,
+                    use_cache=False,
                     input_ids=None,
                     inputs_embeds=question_only_inputs["inputs_embeds"],
                     attention_mask=question_only_inputs["attention_mask"],
                     position_ids=question_only_inputs["position_ids"],
                 )
                 prefill_scores = prefill_collector.as_tensor()
+                del question_only_inputs
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
                     prefill_scores,
                     recent_indices=attention_recent_indices,
@@ -562,6 +576,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
                 if save_raw_attentions:
                     example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
+                del prefill_scores, prefill_collector
+                release_unused_cuda_memory()
 
             # Collect frame-level decode attention for the first generated token and summarize it.
             if "first_token" in attention_modes:
@@ -578,7 +594,9 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     attention_mask=full_prompt_inputs["attention_mask"],
                     position_ids=full_prompt_inputs["position_ids"],
                 )
+                prefill_past_key_values = prefill_outputs.past_key_values
                 first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
+                del prefill_outputs
                 decode_collector = LayerwiseFrameAttentionCollector(
                     frame_token_spans=full_prompt_inputs["frame_token_spans"],
                     query_positions=[0],
@@ -587,9 +605,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 )
                 self._run_with_collector(
                     decode_collector,
+                    use_cache=False,
                     input_ids=first_token[:, None],
-                    past_key_values=prefill_outputs.past_key_values,
+                    past_key_values=prefill_past_key_values,
                 )
+                del full_prompt_inputs, prefill_past_key_values
                 decode_scores = decode_collector.as_tensor()
                 metrics["first_token_attention"] = summarize_layerwise_metric(
                     decode_scores,
@@ -604,12 +624,19 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     example_payload["first_token_id"] = int(first_token.item())
                 if save_raw_attentions:
                     example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
+                del decode_scores, decode_collector, first_token
+                release_unused_cuda_memory()
+
+            del attention_embeds, attention_grid, attention_frame_token_counts, attention_index_lookup
+            release_unused_cuda_memory()
+
+        del frames
 
         # Assemble the sample-level output record with frame metadata and computed metrics.
         record = {
             "video_path": video_path,
             "decode_backend": decode_backend,
-            "num_sampled_frames": len(frames),
+            "num_sampled_frames": num_sampled_frames,
             "recent_chunk_ids": recent_chunk_ids,
             "recent_frame_indices": recent_indices,
             "attention_frame_indices": attention_frame_indices,

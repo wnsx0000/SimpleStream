@@ -179,7 +179,7 @@ computed on a uniform subsample while keeping the recent frames in the set.
 <!-- CUDA_LAUNCH_BLOCKING=1  -->
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_frame_saliency.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_test1.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -188,7 +188,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_frame_sali
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --max_analysis_frames 32 \
+    --max_analysis_frames 12 \
     --similarity_backends siglip \
     --attention_modes first_token,question_prefill \
     --attn_implementation eager
