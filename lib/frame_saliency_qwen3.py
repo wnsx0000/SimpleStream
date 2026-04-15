@@ -16,6 +16,8 @@ from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3Recent
 
 DISPLAY_LAYER_COUNT = 10
 QUESTION_PREFILL_DISPLAY_LAYER_COUNT = 5
+QUESTION_PREFILL_FRAME_MAP_MAX_BINS = 96
+QUESTION_PREFILL_QUESTION_MAP_MAX_BINS = 32
 
 
 def parse_csv_options(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -128,6 +130,7 @@ def summarize_layerwise_metric(
     layer_scores: torch.Tensor,
     recent_indices: list[int],
     display_layer_count: int = DISPLAY_LAYER_COUNT,
+    display_layer_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     if layer_scores.ndim != 2:
         raise ValueError(f"Expected [layers, frames] scores, got shape={tuple(layer_scores.shape)}")
@@ -137,7 +140,10 @@ def summarize_layerwise_metric(
         [tie_aware_percentiles(row.tolist()) for row in layer_scores],
         dtype=torch.float32,
     )
-    display_layer_indices = uniform_center_indices(layer_scores.shape[0], display_layer_count)
+    if display_layer_indices is None:
+        display_layer_indices = uniform_center_indices(layer_scores.shape[0], display_layer_count)
+    else:
+        display_layer_indices = [int(index) for index in display_layer_indices]
     display_layer_scores = layer_scores[display_layer_indices]
     display_layer_percentiles = layer_percentiles[display_layer_indices]
     display_layer_recent_mean = [
@@ -206,6 +212,248 @@ def frame_token_counts_from_grid(grid_thw: torch.Tensor, merge_size: int) -> lis
     return counts
 
 
+def allocate_proportional_bin_counts(token_counts: list[int], max_bins: int) -> list[int]:
+    counts = np.asarray(token_counts, dtype=np.int64)
+    if counts.ndim != 1 or counts.size < 1:
+        return []
+    if np.any(counts < 1):
+        raise ValueError(f"Token counts must be >= 1, got {counts.tolist()}")
+
+    target_bins = int(min(max_bins, int(counts.sum())))
+    if target_bins < int(counts.size):
+        target_bins = int(counts.size)
+
+    desired = counts.astype(np.float64) / float(counts.sum()) * float(target_bins)
+    bins = np.floor(desired).astype(np.int64)
+    bins = np.maximum(bins, 1)
+    bins = np.minimum(bins, counts)
+
+    current_total = int(bins.sum())
+    if current_total > target_bins:
+        removable = bins > 1
+        order = np.argsort(desired - bins, kind="mergesort")
+        for idx in order:
+            while current_total > target_bins and removable[idx]:
+                bins[idx] -= 1
+                current_total -= 1
+                removable[idx] = bins[idx] > 1
+            if current_total == target_bins:
+                break
+    elif current_total < target_bins:
+        order = np.argsort(-(desired - bins), kind="mergesort")
+        remaining_capacity = counts - bins
+        for idx in order:
+            while current_total < target_bins and remaining_capacity[idx] > 0:
+                bins[idx] += 1
+                remaining_capacity[idx] -= 1
+                current_total += 1
+            if current_total == target_bins:
+                break
+
+    if int(bins.sum()) != target_bins:
+        raise RuntimeError(
+            "Failed to allocate proportional bin counts: "
+            f"counts={counts.tolist()} bins={bins.tolist()} target_bins={target_bins}"
+        )
+    return [int(value) for value in bins.tolist()]
+
+
+def build_uniform_token_bin_spans(
+    total_tokens: int,
+    num_bins: int,
+    offset: int = 0,
+) -> list[tuple[int, int]]:
+    total_tokens = int(total_tokens)
+    num_bins = int(num_bins)
+    offset = int(offset)
+    if total_tokens < 1:
+        raise ValueError(f"total_tokens must be >= 1, got {total_tokens}")
+    if num_bins < 1:
+        raise ValueError(f"num_bins must be >= 1, got {num_bins}")
+    if num_bins > total_tokens:
+        raise ValueError(f"num_bins must be <= total_tokens, got bins={num_bins} total_tokens={total_tokens}")
+
+    base_size = total_tokens // num_bins
+    remainder = total_tokens % num_bins
+    spans: list[tuple[int, int]] = []
+    cursor = offset
+    for bin_idx in range(num_bins):
+        bin_size = base_size + (1 if bin_idx < remainder else 0)
+        spans.append((cursor, cursor + bin_size))
+        cursor += bin_size
+    return spans
+
+
+def format_token_bin_label(prefix: str, start_index: int, end_index: int) -> str:
+    start_index = int(start_index)
+    end_index = int(end_index)
+    if end_index <= start_index:
+        raise ValueError(f"Invalid bin label range: start={start_index}, end={end_index}")
+    if end_index - start_index == 1:
+        return f"{prefix}{start_index}"
+    return f"{prefix}{start_index}-{end_index - 1}"
+
+
+@dataclass(frozen=True)
+class QuestionPrefillAttentionMapMetadata:
+    frame_token_start: int
+    frame_token_end: int
+    question_token_start: int
+    question_token_end: int
+    frame_local_bin_spans: list[tuple[int, int]]
+    question_local_bin_spans: list[tuple[int, int]]
+    frame_bin_slices: list[tuple[int, int]]
+    frame_bin_labels: list[str]
+    question_bin_labels: list[str]
+    attention_frame_indices: list[int]
+
+
+def build_question_prefill_attention_map_metadata(
+    frame_token_spans: list[tuple[int, int]],
+    query_positions: list[int],
+    attention_frame_indices: list[int],
+    frame_axis_max_bins: int = QUESTION_PREFILL_FRAME_MAP_MAX_BINS,
+    question_axis_max_bins: int = QUESTION_PREFILL_QUESTION_MAP_MAX_BINS,
+) -> QuestionPrefillAttentionMapMetadata:
+    if not frame_token_spans:
+        raise ValueError("At least one frame token span is required for question-prefill attention maps.")
+    if len(frame_token_spans) != len(attention_frame_indices):
+        raise ValueError(
+            "Frame token spans and attention frame indices must have the same length: "
+            f"{len(frame_token_spans)} vs {len(attention_frame_indices)}"
+        )
+    if not query_positions:
+        raise ValueError("At least one query token position is required for question-prefill attention maps.")
+
+    frame_token_start = int(frame_token_spans[0][0])
+    frame_token_end = int(frame_token_spans[-1][1])
+    expected_frame_start = frame_token_start
+    frame_token_counts: list[int] = []
+    for start, end in frame_token_spans:
+        start = int(start)
+        end = int(end)
+        if start != expected_frame_start:
+            raise ValueError(
+                "Frame token spans must be contiguous for pooling: "
+                f"expected_start={expected_frame_start} got_start={start}"
+            )
+        if end <= start:
+            raise ValueError(f"Invalid frame token span: start={start} end={end}")
+        frame_token_counts.append(end - start)
+        expected_frame_start = end
+
+    question_token_start = int(query_positions[0])
+    question_token_end = int(query_positions[-1]) + 1
+    expected_query_positions = list(range(question_token_start, question_token_end))
+    if [int(position) for position in query_positions] != expected_query_positions:
+        raise ValueError("Query positions must form one contiguous block for question-prefill attention maps.")
+
+    frame_bin_counts = allocate_proportional_bin_counts(frame_token_counts, max_bins=frame_axis_max_bins)
+    frame_local_bin_spans: list[tuple[int, int]] = []
+    frame_bin_slices: list[tuple[int, int]] = []
+    pooled_cursor = 0
+    local_cursor = 0
+    for frame_idx, (token_count, bin_count) in enumerate(zip(frame_token_counts, frame_bin_counts)):
+        local_spans = build_uniform_token_bin_spans(token_count, bin_count, offset=local_cursor)
+        frame_local_bin_spans.extend(local_spans)
+        frame_bin_slices.append((pooled_cursor, pooled_cursor + bin_count))
+        pooled_cursor += bin_count
+        local_cursor += token_count
+
+    question_token_count = question_token_end - question_token_start
+    question_bin_count = min(question_axis_max_bins, question_token_count)
+    question_global_bin_spans = build_uniform_token_bin_spans(
+        question_token_count,
+        question_bin_count,
+        offset=question_token_start,
+    )
+    question_local_bin_spans = [
+        (start - question_token_start, end - question_token_start)
+        for start, end in question_global_bin_spans
+    ]
+
+    return QuestionPrefillAttentionMapMetadata(
+        frame_token_start=frame_token_start,
+        frame_token_end=frame_token_end,
+        question_token_start=question_token_start,
+        question_token_end=question_token_end,
+        frame_local_bin_spans=frame_local_bin_spans,
+        question_local_bin_spans=question_local_bin_spans,
+        frame_bin_slices=frame_bin_slices,
+        frame_bin_labels=[str(int(index)) for index in attention_frame_indices],
+        question_bin_labels=[
+            format_token_bin_label(
+                "q",
+                start - question_token_start,
+                end - question_token_start,
+            )
+            for start, end in question_global_bin_spans
+        ],
+        attention_frame_indices=[int(index) for index in attention_frame_indices],
+    )
+
+
+def mean_pool_2d_by_spans(
+    matrix: torch.Tensor,
+    row_spans: list[tuple[int, int]],
+    col_spans: list[tuple[int, int]],
+) -> torch.Tensor:
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected a 2D tensor for pooling, got shape={tuple(matrix.shape)}")
+    if not row_spans or not col_spans:
+        return torch.empty((len(row_spans), len(col_spans)), dtype=matrix.dtype, device=matrix.device)
+
+    prefix = matrix.cumsum(dim=0).cumsum(dim=1)
+    prefix = F.pad(prefix, (1, 0, 1, 0))
+
+    row_starts = torch.tensor([int(start) for start, _ in row_spans], dtype=torch.long, device=matrix.device)
+    row_ends = torch.tensor([int(end) for _, end in row_spans], dtype=torch.long, device=matrix.device)
+    col_starts = torch.tensor([int(start) for start, _ in col_spans], dtype=torch.long, device=matrix.device)
+    col_ends = torch.tensor([int(end) for _, end in col_spans], dtype=torch.long, device=matrix.device)
+
+    pooled_sum = (
+        prefix[row_ends[:, None], col_ends[None, :]]
+        - prefix[row_starts[:, None], col_ends[None, :]]
+        - prefix[row_ends[:, None], col_starts[None, :]]
+        + prefix[row_starts[:, None], col_starts[None, :]]
+    )
+    areas = (
+        (row_ends - row_starts).to(dtype=matrix.dtype)[:, None]
+        * (col_ends - col_starts).to(dtype=matrix.dtype)[None, :]
+    )
+    return pooled_sum / areas
+
+
+def build_question_prefill_attention_maps(
+    attn_weights: torch.Tensor,
+    metadata: QuestionPrefillAttentionMapMetadata,
+) -> dict[str, torch.Tensor]:
+    if attn_weights.ndim != 3:
+        raise ValueError(f"Expected [heads, seq_len, seq_len] attention weights, got shape={tuple(attn_weights.shape)}")
+
+    mean_attention = attn_weights.float().mean(dim=0)
+    frame_attention = mean_attention[
+        metadata.frame_token_start : metadata.frame_token_end,
+        metadata.frame_token_start : metadata.frame_token_end,
+    ]
+    question_attention = mean_attention[
+        metadata.question_token_start : metadata.question_token_end,
+        metadata.frame_token_start : metadata.frame_token_end,
+    ]
+    return {
+        "frame_frame_map": mean_pool_2d_by_spans(
+            frame_attention,
+            metadata.frame_local_bin_spans,
+            metadata.frame_local_bin_spans,
+        ).detach().cpu(),
+        "question_frame_map": mean_pool_2d_by_spans(
+            question_attention,
+            metadata.question_local_bin_spans,
+            metadata.frame_local_bin_spans,
+        ).detach().cpu(),
+    }
+
+
 def flatten_chunks(
     chunks: list[Any],
     recent_frames_only: int,
@@ -244,10 +492,14 @@ class LayerwiseFrameAttentionCollector:
     query_positions: list[int]
     num_layers: int
     save_raw: bool = False
+    map_layer_indices: list[int] | None = None
+    question_prefill_map_metadata: QuestionPrefillAttentionMapMetadata | None = None
 
     def __post_init__(self) -> None:
         self.layer_scores: list[torch.Tensor | None] = [None] * self.num_layers
         self.layer_raw_attentions: dict[int, torch.Tensor] = {}
+        self.map_layer_index_set = set(int(index) for index in (self.map_layer_indices or []))
+        self.layer_attention_maps: dict[int, dict[str, torch.Tensor]] = {}
 
     def make_hook(self, layer_idx: int):
         def hook(_module: Any, _inputs: Any, output: Any):
@@ -262,6 +514,11 @@ class LayerwiseFrameAttentionCollector:
                 raise RuntimeError(f"Unexpected attention shape from layer {layer_idx}: {tuple(attn_weights.shape)}")
 
             selected = attn_weights[0]
+            if self.question_prefill_map_metadata is not None and layer_idx in self.map_layer_index_set:
+                self.layer_attention_maps[layer_idx] = build_question_prefill_attention_maps(
+                    selected,
+                    metadata=self.question_prefill_map_metadata,
+                )
             if self.query_positions:
                 selected = selected[:, self.query_positions, :]
             if selected.ndim == 2:
@@ -288,6 +545,33 @@ class LayerwiseFrameAttentionCollector:
         if missing:
             raise RuntimeError(f"Missing captured attentions for layers: {', '.join(missing)}")
         return torch.stack([value for value in self.layer_scores if value is not None], dim=0)
+
+    def export_question_prefill_attention_maps(
+        self,
+        display_layer_indices: list[int],
+    ) -> dict[str, Any] | None:
+        metadata = self.question_prefill_map_metadata
+        if metadata is None or not display_layer_indices:
+            return None
+
+        frame_frame_maps: list[torch.Tensor] = []
+        question_frame_maps: list[torch.Tensor] = []
+        for layer_idx in display_layer_indices:
+            layer_payload = self.layer_attention_maps.get(int(layer_idx))
+            if layer_payload is None:
+                return None
+            frame_frame_maps.append(layer_payload["frame_frame_map"])
+            question_frame_maps.append(layer_payload["question_frame_map"])
+
+        return {
+            "frame_frame_maps": torch.stack(frame_frame_maps, dim=0),
+            "question_frame_maps": torch.stack(question_frame_maps, dim=0),
+            "display_layer_indices": [int(index) for index in display_layer_indices],
+            "attention_frame_indices": [int(index) for index in metadata.attention_frame_indices],
+            "frame_bin_slices": [[int(start), int(end)] for start, end in metadata.frame_bin_slices],
+            "frame_bin_labels": list(metadata.frame_bin_labels),
+            "question_bin_labels": list(metadata.question_bin_labels),
+        }
 
 
 class SiglipFrameEncoder:
@@ -704,17 +988,33 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
 
             # Collect layer-wise prefill attention showing which frames the question tokens focus on.
             if "question_prefill" in attention_modes:
+                text_layers = self._get_text_layers()
+                question_prefill_display_layers = uniform_center_indices(
+                    len(text_layers),
+                    QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
+                )
                 question_only_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,
                     cached_grid_thw=attention_grid,
                     frame_token_counts=attention_frame_token_counts,
                     question=similarity_text or "",
                 )
+                map_metadata = (
+                    build_question_prefill_attention_map_metadata(
+                        frame_token_spans=question_only_inputs["frame_token_spans"],
+                        query_positions=question_only_inputs["question_token_positions"],
+                        attention_frame_indices=attention_frame_indices,
+                    )
+                    if save_example_matrices
+                    else None
+                )
                 prefill_collector = LayerwiseFrameAttentionCollector(
                     frame_token_spans=question_only_inputs["frame_token_spans"],
                     query_positions=question_only_inputs["question_token_positions"],
-                    num_layers=len(self._get_text_layers()),
+                    num_layers=len(text_layers),
                     save_raw=save_raw_attentions,
+                    map_layer_indices=question_prefill_display_layers if map_metadata is not None else None,
+                    question_prefill_map_metadata=map_metadata,
                 )
                 _prefill_output = self._run_with_collector(
                     prefill_collector,
@@ -731,6 +1031,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     prefill_scores,
                     recent_indices=attention_recent_indices,
                     display_layer_count=QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
+                    display_layer_indices=question_prefill_display_layers,
                 )
                 metrics["question_prefill_attention"]["attention_frame_indices"] = attention_frame_indices
                 metrics["question_prefill_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
@@ -738,6 +1039,9 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if save_example_matrices:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
+                    attention_map_payload = prefill_collector.export_question_prefill_attention_maps(display_layer_indices)
+                    if attention_map_payload is not None:
+                        example_payload["question_prefill_attention_maps"] = attention_map_payload
                 if save_raw_attentions:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["raw_question_prefill_attentions"] = {

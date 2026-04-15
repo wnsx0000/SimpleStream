@@ -32,7 +32,7 @@ class SaliencyExperimentConfig:
     max_samples_per_subset: int | None = None
     similarity_backends: list[str] = field(default_factory=list)
     attention_modes: list[str] = field(default_factory=list)
-    save_example_matrices: int = 8
+    save_example_matrices: int = 3
     save_raw_attn_examples: int = 0
     max_analysis_frames: int = 40
     seed: int = 42
@@ -54,7 +54,7 @@ def add_common_saliency_args(
     parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--max_samples_per_subset", type=int, default=None)
-    parser.add_argument("--save_example_matrices", type=int, default=8)
+    parser.add_argument("--save_example_matrices", type=int, default=3)
     if include_save_raw_attn_examples:
         parser.add_argument("--save_raw_attn_examples", type=int, default=0)
     parser.add_argument("--max_analysis_frames", type=int, default=40)
@@ -216,8 +216,16 @@ def run_saliency_experiment(
     examples_dir.mkdir(parents=True, exist_ok=True)
 
     existing_records, done_keys = load_jsonl_results(str(records_path))
-    saved_examples = sum(1 for record in existing_records if record.get("matrix_example_saved"))
-    saved_raw = sum(1 for record in existing_records if record.get("raw_attention_saved"))
+    saved_examples_by_task = Counter(
+        str(record.get("task", ""))
+        for record in existing_records
+        if record.get("matrix_example_saved")
+    )
+    saved_raw_by_task = Counter(
+        str(record.get("task", ""))
+        for record in existing_records
+        if record.get("raw_attention_saved")
+    )
 
     print("\n" + "=" * 60)
     print(config.run_label)
@@ -248,8 +256,11 @@ def run_saliency_experiment(
                     continue
 
                 video_path = os.path.join(config.chunked_dir, f"{anno['id']}.mp4")
-                save_example = saved_examples < int(config.save_example_matrices)
-                save_raw = bool(config.attention_modes) and saved_raw < int(config.save_raw_attn_examples)
+                task_name = str(anno["task"])
+                save_example = saved_examples_by_task[task_name] < int(config.save_example_matrices)
+                save_raw = bool(config.attention_modes) and (
+                    saved_raw_by_task[task_name] < int(config.save_raw_attn_examples)
+                )
 
                 try:
                     record, example_payload = analyzer.analyze_sample(
@@ -276,17 +287,29 @@ def run_saliency_experiment(
                         **record,
                     }
                     if example_payload is not None:
+                        example_payload.update(
+                            {
+                                "split": split_name,
+                                "task": anno["task"],
+                                "id": anno["id"],
+                                "question": anno.get("question"),
+                            }
+                        )
                         example_name = slugify(key) or f"example-{len(all_records)}"
                         example_path = examples_dir / f"{example_name}.pt"
                         torch.save(example_payload, example_path)
+                        payload_has_raw_attention = any(
+                            str(key_name).startswith("raw_")
+                            for key_name in example_payload.keys()
+                        )
                         output["example_saved"] = True
                         output["matrix_example_saved"] = bool(save_example)
-                        output["raw_attention_saved"] = bool(save_raw)
+                        output["raw_attention_saved"] = bool(save_raw and payload_has_raw_attention)
                         output["example_path"] = str(example_path)
                         if save_example:
-                            saved_examples += 1
-                        if save_raw:
-                            saved_raw += 1
+                            saved_examples_by_task[task_name] += 1
+                        if save_raw and payload_has_raw_attention:
+                            saved_raw_by_task[task_name] += 1
                     else:
                         output["example_saved"] = False
                         output["matrix_example_saved"] = False

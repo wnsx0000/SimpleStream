@@ -181,6 +181,15 @@ with equal task weight. Metric summaries now include both `*_mean` and `*_std`
 fields. Aggregate plots are written both to the
 pooled `plots/` directory and to split-specific directories under
 `plots/backward/` and `plots/realtime/`.
+Example exports use task/subset caps: `--save_example_matrices 3` means up to
+3 saved examples per OVO task such as `ASI`, `EPM`, or `STU`, not 3 total.
+When `question_prefill` example exports are enabled, each saved example also
+produces `question_prefill_frame_frame_maps.png` and
+`question_prefill_question_frame_maps.png` under `plots/examples/<example>/`.
+The pooled `plots/` directory additionally includes
+`question_prefill_frame_frame_maps_average.png` and
+`question_prefill_question_frame_maps_average.png`, averaged over the saved
+example subset only.
 If the sampled window is longer than `--max_analysis_frames`, SigLIP similarity
 and attention are computed on a uniform subsample while keeping the recent
 frames in the set.
@@ -190,42 +199,6 @@ Run SigLIP similarity and attention saliency with separate entrypoints.
 
 <!-- CUDA_LAUNCH_BLOCKING=1  -->
 
-attention smoke test.
-
-```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_2.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_attention_smoke_$(date +%Y%m%d_%H%M%S) \
-    --analysis_scope smoke \
-    --recent_frames_only 4 \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    --max_analysis_frames 12 \
-    --attention_modes question_prefill,first_token \
-    --attn_implementation eager \
-    > ./main_experiments/results/ovo_qwen3vl_attention_smoke_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
-
-siglip smoke test.
-
-```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_1.py \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_smoke_$(date +%Y%m%d_%H%M%S) \
-    --analysis_scope smoke \
-    --recent_frames_only 4 \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    --max_analysis_frames 12 \
-    --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/ovo_qwen3vl_siglip_smoke_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
-
-Use `--analysis_scope full` to run the full backward/realtime splits instead of
-the smoke subset (8 samples per split).
 Use `--max_samples_per_subset 50` to randomly sample up to 50 examples from
 each OVO subset/task independently (for example `EPM`, `STU`, `OCR`) within the
 backward/realtime splits. When `--max_samples_per_subset` is set, it overrides
@@ -233,6 +206,10 @@ the default smoke split cap.
 
 question_prefill test.
 This run saves 5 uniformly spaced decoder layers, including the first and last.
+Saved example plots include both frame-to-frame and question-to-frame pooled
+attention maps, plus averages over the saved example subset.
+
+attention scoring test.
 
 ```bash
 CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_2.py \
@@ -251,7 +228,7 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_
     > ./main_experiments/results/nohup_ovo_qwen3vl_attention_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-siglip test.
+siglip similarity test.
 
 ```bash
 CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_1.py \
