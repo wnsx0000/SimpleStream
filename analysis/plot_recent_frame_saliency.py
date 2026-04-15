@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -11,9 +13,25 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from lib.frame_saliency_qwen3 import build_experiment_summary
+from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
+
 DISPLAY_LAYER_COUNT = 5
 QUESTION_PREFILL_FRAME_FRAME_AVERAGE_SHAPE = (64, 64)
 QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE = (32, 64)
+TASK_PLOT_ORDER = [*BACKWARD_TASKS, *REAL_TIME_TASKS]
+ATTENTION_METRIC_SPECS = (
+    ("question_prefill_attention", "question_prefill", "Question Prefill Attention"),
+    ("first_token_attention", "first_token", "First Token Attention"),
+)
+LINE_PLOT_SPECS = (
+    ("percentile_mean", "layer_recent4_mean_percentile_mean", "Recent4 Mean Percentile", "Mean Percentile"),
+    ("percentile_std", "layer_recent4_mean_percentile_std", "Recent4 Mean Percentile Std", "Std"),
+    ("top4_overlap_mean", "layer_recent4_top4_overlap_mean", "Recent4 Top4 Overlap", "Mean Overlap"),
+    ("top4_overlap_std", "layer_recent4_top4_overlap_std", "Recent4 Top4 Overlap Std", "Std"),
+)
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -43,45 +61,6 @@ def records_for_split(records: list[dict[str, Any]], split_name: str) -> list[di
     return [record for record in records if str(record.get("split", "")) == split_name]
 
 
-def scalar_metric_recent_indices(record: dict[str, Any], metric: dict[str, Any]) -> list[int]:
-    subset_recent = metric.get("recent_frame_indices_within_analysis")
-    if subset_recent is not None:
-        return [int(index) for index in subset_recent]
-    return [int(index) for index in record.get("recent_frame_indices", [])]
-
-
-def scalar_metric_frame_indices(metric: dict[str, Any], field: str) -> np.ndarray:
-    metric_frame_indices = metric.get("analysis_frame_indices")
-    if metric_frame_indices is not None:
-        return np.asarray(metric_frame_indices, dtype=np.int64)
-    return np.arange(len(metric.get(field, [])), dtype=np.int64)
-
-
-def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: str) -> list[float]:
-    values: list[float] = []
-    for record in valid_records(records):
-        metric = record.get("metrics", {}).get(metric_name)
-        if not metric:
-            continue
-        if metric_name.endswith("_attention"):
-            frame_values = metric.get("mean_percentile", [])
-            recent_indices = metric.get("recent_frame_indices_within_attention", [])
-        else:
-            frame_values = metric.get("frame_percentiles", [])
-            recent_indices = scalar_metric_recent_indices(record, metric)
-        values.extend(float(frame_values[idx]) for idx in recent_indices if 0 <= idx < len(frame_values))
-    return values
-
-
-def metric_recent_sample_scores(records: list[dict[str, Any]], metric_name: str, field: str) -> list[float]:
-    values: list[float] = []
-    for record in valid_records(records):
-        metric = record.get("metrics", {}).get(metric_name)
-        if metric and field in metric:
-            values.append(float(metric[field]))
-    return values
-
-
 def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_COUNT) -> list[int]:
     total_count = int(total_count)
     target_count = int(target_count)
@@ -108,26 +87,6 @@ def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[n
     if sampled_indices.size < 1:
         return None, None
     return sampled_indices, values[sampled_indices]
-
-
-def attention_layer_means(records: list[dict[str, Any]], metric_name: str, field: str) -> tuple[np.ndarray | None, np.ndarray | None]:
-    rows = []
-    display_indices: np.ndarray | None = None
-    for record in valid_records(records):
-        metric = record.get("metrics", {}).get(metric_name)
-        if not metric:
-            continue
-        layer_indices, values = normalized_metric_layer_array(metric, field)
-        if layer_indices is None or values is None:
-            continue
-        if display_indices is None:
-            display_indices = layer_indices
-        if values.shape[0] != display_indices.shape[0] or not np.array_equal(layer_indices, display_indices):
-            continue
-        rows.append(values)
-    if not rows:
-        return None, None
-    return display_indices, np.vstack(rows).mean(axis=0)
 
 
 def interpolate_layer_percentiles(
@@ -162,126 +121,151 @@ def interpolate_layer_percentiles(
     return display_indices, np.stack(stacked, axis=0).mean(axis=0)
 
 
-def plot_violin_distribution(records: list[dict[str, Any]], plots_dir: Path) -> None:
-    metric_map = {
-        "siglip_similarity": "SigLIP Frame-Question Similarity",
-        "question_prefill_attention": "Question Prefill Attn",
-        "first_token_attention": "First Token Attn",
+def ordered_task_names(summary: dict[str, Any]) -> list[str]:
+    task_summary = summary.get("tasks", {})
+    known_tasks = [task for task in TASK_PLOT_ORDER if task in task_summary]
+    extra_tasks = sorted(task for task in task_summary if task not in TASK_PLOT_ORDER)
+    return [*known_tasks, *extra_tasks]
+
+
+def extract_metric_series(metric: dict[str, Any], field_name: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+    return normalized_metric_layer_array(metric, field_name)
+
+
+def metric_series_groups(summary: dict[str, Any], metric_name: str) -> list[tuple[str, dict[str, Any]]]:
+    groups: list[tuple[str, dict[str, Any]]] = []
+
+    total_metric = summary.get("metrics", {}).get(metric_name)
+    if isinstance(total_metric, dict):
+        groups.append(("total", total_metric))
+
+    split_labels = {
+        "backward": "backward",
+        "realtime": "realtime",
     }
-    data = []
-    labels = []
-    for metric_name, label in metric_map.items():
-        values = metric_recent_frame_percentiles(records, metric_name)
-        if values:
-            data.append(values)
-            labels.append(label)
-    if not data:
+    for split_name, label in split_labels.items():
+        split_metric = summary.get("splits", {}).get(split_name, {}).get("metrics", {}).get(metric_name)
+        if isinstance(split_metric, dict):
+            groups.append((label, split_metric))
+
+    for task_name in ordered_task_names(summary):
+        task_metric = summary.get("tasks", {}).get(task_name, {}).get("metrics", {}).get(metric_name)
+        if isinstance(task_metric, dict):
+            groups.append((task_name, task_metric))
+
+    return groups
+
+
+def line_styles() -> dict[str, dict[str, Any]]:
+    return {
+        "total": {"color": "black", "linewidth": 3.0, "linestyle": "-", "marker": "o"},
+        "backward": {"color": "#1f77b4", "linewidth": 2.4, "linestyle": "--", "marker": "o"},
+        "realtime": {"color": "#d62728", "linewidth": 2.4, "linestyle": "-.", "marker": "o"},
+    }
+
+
+def collect_metric_lines(
+    summary: dict[str, Any],
+    metric_name: str,
+    field_name: str,
+) -> tuple[np.ndarray | None, list[tuple[str, np.ndarray]]]:
+    groups = metric_series_groups(summary, metric_name)
+    if not groups:
+        return None, []
+
+    base_indices: np.ndarray | None = None
+    lines: list[tuple[str, np.ndarray]] = []
+    for label, metric in groups:
+        layer_indices, values = extract_metric_series(metric, field_name)
+        if layer_indices is None or values is None or values.ndim != 1:
+            continue
+        if base_indices is None:
+            base_indices = layer_indices
+        if not np.array_equal(layer_indices, base_indices):
+            print(
+                f"Skipping {metric_name} {field_name} line for {label}: "
+                "display_layer_indices do not match the pooled metric."
+            )
+            continue
+        lines.append((label, values))
+    return base_indices, lines
+
+
+def plot_attention_metric_line(
+    summary: dict[str, Any],
+    metric_name: str,
+    metric_title: str,
+    file_prefix: str,
+    field_suffix: str,
+    field_name: str,
+    plot_title: str,
+    y_label: str,
+    plots_dir: Path,
+) -> None:
+    layer_indices, lines = collect_metric_lines(summary, metric_name, field_name)
+    if layer_indices is None or not lines:
         return
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    parts = ax.violinplot(data, showmeans=False, showextrema=False, widths=0.8)
-    for body in parts["bodies"]:
-        body.set_alpha(0.35)
-    ax.boxplot(data, widths=0.18, positions=np.arange(1, len(data) + 1))
-    ax.set_xticks(np.arange(1, len(data) + 1))
-    ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel("Recent Frame Percentile Rank")
+    pooled_names = {"total", "backward", "realtime"}
+    task_lines = [(label, values) for label, values in lines if label not in pooled_names]
+    pooled_lines = [(label, values) for label, values in lines if label in pooled_names]
+    task_colors = plt.get_cmap("tab20", max(len(task_lines), 1))
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for idx, (label, values) in enumerate(task_lines):
+        ax.plot(
+            layer_indices,
+            values,
+            label=label,
+            color=task_colors(idx),
+            linewidth=1.8,
+            marker="o",
+            alpha=0.9,
+        )
+
+    style_map = line_styles()
+    pooled_label_map = {
+        "total": "Total",
+        "backward": "Backward Tracing Subset",
+        "realtime": "Real-time Subset",
+    }
+    for label, values in pooled_lines:
+        ax.plot(
+            layer_indices,
+            values,
+            label=pooled_label_map[label],
+            **style_map[label],
+        )
+
+    ax.set_title(f"{metric_title}: {plot_title}")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(y_label)
+    ax.set_xticks(layer_indices)
     ax.set_ylim(0.0, 1.0)
-    ax.set_title("Recent4 Percentile Distribution")
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+    ax.legend(ncol=3, fontsize=9)
     fig.tight_layout()
-    fig.savefig(plots_dir / "recent_frame_percentile_distribution.png", dpi=200)
+    fig.savefig(plots_dir / f"{file_prefix}_{field_suffix}.png", dpi=200)
     plt.close(fig)
 
 
-def plot_sample_histograms(records: list[dict[str, Any]], plots_dir: Path) -> None:
-    metric_map = {
-        "siglip_similarity": "SigLIP Frame-Question Similarity",
-        "question_prefill_attention": "Question Prefill Attn",
-        "first_token_attention": "First Token Attn",
-    }
-    available = [
-        (metric_name, label)
-        for metric_name, label in metric_map.items()
-        if metric_recent_sample_scores(records, metric_name, "recent4_mean_percentile")
-    ]
-    if not available:
-        return
-
-    fig, axes = plt.subplots(len(available), 1, figsize=(10, 3.5 * len(available)), squeeze=False)
-    for ax, (metric_name, label) in zip(axes[:, 0], available):
-        values = metric_recent_sample_scores(records, metric_name, "recent4_mean_percentile")
-        ax.hist(values, bins=15, range=(0.0, 1.0), alpha=0.8)
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylabel("Count")
-        ax.set_title(f"{label}: Recent4 Mean Percentile")
-    axes[-1, 0].set_xlabel("Mean Percentile")
-    fig.tight_layout()
-    fig.savefig(plots_dir / "recent4_mean_percentile_histograms.png", dpi=200)
-    plt.close(fig)
-
-
-def plot_overlap_bars(records: list[dict[str, Any]], plots_dir: Path) -> None:
-    metric_map = {
-        "siglip_similarity": ("SigLIP Frame-Question Similarity", "recent4_top4_overlap"),
-        "question_prefill_attention": ("Question Prefill Attn", "recent4_top4_overlap"),
-        "first_token_attention": ("First Token Attn", "recent4_top4_overlap"),
-    }
-    labels = []
-    values = []
-    for metric_name, (label, field) in metric_map.items():
-        metric_values = metric_recent_sample_scores(records, metric_name, field)
-        if metric_values:
-            labels.append(label)
-            values.append(float(np.mean(metric_values)))
-    if not values:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(labels, values)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_ylabel("Top4 Overlap")
-    ax.set_title("Recent4 vs Metric Top4 Overlap")
-    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
-    fig.tight_layout()
-    fig.savefig(plots_dir / "recent4_top4_overlap.png", dpi=200)
-    plt.close(fig)
-
-
-def plot_layer_lines(records: list[dict[str, Any]], plots_dir: Path) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(12, 9), squeeze=False)
-    plotted = False
-    for metric_name, label in (
-        ("question_prefill_attention", "Question Prefill"),
-        ("first_token_attention", "First Token"),
-    ):
-        percentile_layers, mean_percentiles = attention_layer_means(records, metric_name, "layer_recent4_mean_percentile")
-        overlap_layers, mean_overlap = attention_layer_means(records, metric_name, "layer_recent4_top4_overlap")
-        if percentile_layers is not None and mean_percentiles is not None:
-            axes[0, 0].plot(percentile_layers, mean_percentiles, label=label)
-            axes[0, 0].set_xticks(percentile_layers)
-            plotted = True
-        if overlap_layers is not None and mean_overlap is not None:
-            axes[1, 0].plot(overlap_layers, mean_overlap, label=label)
-            axes[1, 0].set_xticks(overlap_layers)
-            plotted = True
-    if not plotted:
-        plt.close(fig)
-        return
-
-    axes[0, 0].set_title("Layer-wise Recent4 Mean Percentile")
-    axes[0, 0].set_ylabel("Mean Percentile")
-    axes[0, 0].set_ylim(0.0, 1.0)
-    axes[0, 0].legend()
-
-    axes[1, 0].set_title("Layer-wise Recent4 Top4 Overlap")
-    axes[1, 0].set_xlabel("Layer")
-    axes[1, 0].set_ylabel("Overlap")
-    axes[1, 0].set_ylim(0.0, 1.0)
-    axes[1, 0].legend()
-
-    fig.tight_layout()
-    fig.savefig(plots_dir / "layerwise_recent4_curves.png", dpi=200)
-    plt.close(fig)
+def plot_attention_line_plots(summary: dict[str, Any], plots_dir: Path) -> None:
+    plots_dir = ensure_dir(plots_dir)
+    for metric_name, file_prefix, metric_title in ATTENTION_METRIC_SPECS:
+        if metric_name not in summary.get("metrics", {}):
+            continue
+        for field_suffix, field_name, plot_title, y_label in LINE_PLOT_SPECS:
+            plot_attention_metric_line(
+                summary,
+                metric_name=metric_name,
+                metric_title=metric_title,
+                file_prefix=file_prefix,
+                field_suffix=field_suffix,
+                field_name=field_name,
+                plot_title=plot_title,
+                y_label=y_label,
+                plots_dir=plots_dir,
+            )
 
 
 def plot_layer_heatmaps(records: list[dict[str, Any]], plots_dir: Path) -> None:
@@ -543,8 +527,13 @@ def compute_average_question_prefill_maps(
 
 
 def plot_question_prefill_attention_map_averages(payloads: list[dict[str, Any]], plots_dir: Path) -> None:
+    available_payloads = [payload for payload in payloads if question_prefill_map_payload(payload) is not None]
+    if not available_payloads:
+        print("Skipping question-prefill average map heatmaps: no saved example payload includes question_prefill_attention_maps.")
+        return
+
     display_layers, frame_frame_average = compute_average_question_prefill_maps(
-        payloads,
+        available_payloads,
         field_name="frame_frame_maps",
         target_shape=QUESTION_PREFILL_FRAME_FRAME_AVERAGE_SHAPE,
     )
@@ -560,7 +549,7 @@ def plot_question_prefill_attention_map_averages(payloads: list[dict[str, Any]],
         )
 
     display_layers, question_frame_average = compute_average_question_prefill_maps(
-        payloads,
+        available_payloads,
         field_name="question_frame_maps",
         target_shape=QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE,
     )
@@ -579,58 +568,8 @@ def plot_question_prefill_attention_map_averages(payloads: list[dict[str, Any]],
 def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str, Any] | None = None) -> None:
     payload = torch.load(example_path, map_location="cpu") if payload is None else payload
     example_key = example_path.stem
-    recent_indices = set(int(index) for index in payload.get("recent_frame_indices", []))
     example_dir = ensure_dir(plots_dir / "examples" / example_key)
-
     metrics = payload.get("metrics", {})
-    line_plotted = False
-    fig, ax = plt.subplots(figsize=(11, 5))
-    if "siglip_similarity" in metrics:
-        siglip_x = scalar_metric_frame_indices(metrics["siglip_similarity"], "frame_scores")
-        ax.plot(
-            siglip_x,
-            metrics["siglip_similarity"]["frame_scores"],
-            label="SigLIP Frame-Question Similarity",
-        )
-        line_plotted = True
-    if "question_prefill_attention" in metrics:
-        attn_x = np.asarray(
-            metrics["question_prefill_attention"].get(
-                "attention_frame_indices",
-                list(range(len(metrics["question_prefill_attention"]["mean_attention_score"]))),
-            ),
-            dtype=np.int64,
-        )
-        ax.plot(
-            attn_x,
-            metrics["question_prefill_attention"]["mean_attention_score"],
-            label="Question Prefill Attn",
-        )
-        line_plotted = True
-    if "first_token_attention" in metrics:
-        attn_x = np.asarray(
-            metrics["first_token_attention"].get(
-                "attention_frame_indices",
-                list(range(len(metrics["first_token_attention"]["mean_attention_score"]))),
-            ),
-            dtype=np.int64,
-        )
-        ax.plot(
-            attn_x,
-            metrics["first_token_attention"]["mean_attention_score"],
-            label="First Token Attn",
-        )
-        line_plotted = True
-    if line_plotted:
-        for index in recent_indices:
-            ax.axvline(index, color="black", linestyle="--", linewidth=0.8, alpha=0.35)
-        ax.set_title(f"Frame-wise Scores: {example_key}")
-        ax.set_xlabel("Frame Index")
-        ax.set_ylabel("Score")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(example_dir / "frame_score_lines.png", dpi=200)
-    plt.close(fig)
 
     for metric_name, title in (
         ("question_prefill_attention", "Question Prefill"),
@@ -666,6 +605,10 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
 
     map_payload = question_prefill_map_payload(payload)
     if map_payload is None:
+        print(
+            f"Skipping question-prefill map heatmaps for {example_key}: "
+            "saved example payload does not contain question_prefill_attention_maps."
+        )
         return
 
     display_layer_indices = [int(index) for index in map_payload.get("display_layer_indices", [])]
@@ -714,15 +657,13 @@ def load_example_payloads(examples_dir: Path) -> list[tuple[Path, dict[str, Any]
     return payloads
 
 
-def generate_aggregate_plots(records: list[dict[str, Any]], plots_dir: Path) -> None:
+def generate_top_level_plots(records: list[dict[str, Any]], plots_dir: Path) -> None:
     plots_dir = ensure_dir(plots_dir)
     if not records:
         return
 
-    plot_violin_distribution(records, plots_dir)
-    plot_sample_histograms(records, plots_dir)
-    plot_overlap_bars(records, plots_dir)
-    plot_layer_lines(records, plots_dir)
+    summary = build_experiment_summary(records, config={})
+    plot_attention_line_plots(summary, plots_dir)
     plot_layer_heatmaps(records, plots_dir)
 
 
@@ -733,9 +674,9 @@ def generate_plots(result_dir: str | Path) -> None:
     if not records:
         return
 
-    generate_aggregate_plots(records, plots_dir)
+    generate_top_level_plots(records, plots_dir)
     for split_name in ("backward", "realtime"):
-        generate_aggregate_plots(records_for_split(records, split_name), plots_dir / split_name)
+        plot_layer_heatmaps(records_for_split(records, split_name), ensure_dir(plots_dir / split_name))
 
     examples_dir = result_dir / "examples"
     if not examples_dir.exists():

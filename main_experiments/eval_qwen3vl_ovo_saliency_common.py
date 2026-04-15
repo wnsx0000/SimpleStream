@@ -123,16 +123,6 @@ def append_record(handle: Any, record: dict[str, Any]) -> None:
     handle.flush()
 
 
-def maybe_generate_plots(result_dir: str) -> str | None:
-    try:
-        from analysis.plot_recent_frame_saliency import generate_plots
-
-        generate_plots(result_dir)
-        return None
-    except Exception as exc:
-        return str(exc)
-
-
 def format_mean_std(mean_value: Any, std_value: Any) -> str:
     if mean_value is None:
         return "n/a"
@@ -355,19 +345,12 @@ def run_saliency_experiment(
     summary_config.update(config.extra_summary_config)
 
     summary = build_experiment_summary(all_records, config=summary_config)
-    plot_error = maybe_generate_plots(str(result_dir))
-    if plot_error:
-        summary["plot_generation_error"] = plot_error
     save_json(result_dir / "summary.json", summary)
 
     print("\n" + "=" * 60)
     print_metric_summary(summary)
     print(f"Records saved to: {records_path}")
     print(f"Summary saved to: {result_dir / 'summary.json'}")
-    if plot_error:
-        print(f"Plot generation skipped: {plot_error}")
-    else:
-        print(f"Plots saved to: {result_dir / 'plots'}")
     print("=" * 60 + "\n")
 
     return summary

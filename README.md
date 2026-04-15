@@ -172,15 +172,17 @@ realtime splits. The script computes:
 - SigLIP-SO400M frame-question similarity
 - Layer-wise Qwen3 attention scores for `question_prefill` and `first_token`
 
-Outputs are saved under `records.jsonl`, `summary.json`, `examples/`, and `plots/`.
+Outputs are saved under `records.jsonl`, `summary.json`, and `examples/`.
 The top-level fields in `summary.json` remain pooled across the analyzed records,
 while split-specific summaries are stored under `summary["splits"]["backward"]`
 and `summary["splits"]["realtime"]`. Each split section also includes
 `task_mean_metrics`, which averages the task subset summaries within that split
 with equal task weight. Metric summaries now include both `*_mean` and `*_std`
-fields. Aggregate plots are written both to the
-pooled `plots/` directory and to split-specific directories under
-`plots/backward/` and `plots/realtime/`.
+fields. Plot generation is run separately with
+`python analysis/plot_recent_frame_saliency.py --result-dir <result_dir>`.
+The pooled `plots/` directory contains the 4 layer-wise line plots per attention
+mode plus aggregate heatmaps, while `plots/backward/` and `plots/realtime/`
+contain split-specific layer heatmaps only.
 Example exports use task/subset caps: `--save_example_matrices 3` means up to
 3 saved examples per OVO task such as `ASI`, `EPM`, or `STU`, not 3 total.
 When `question_prefill` example exports are enabled, each saved example also
@@ -226,6 +228,13 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_
     --attention_modes question_prefill \
     --attn_implementation eager \
     > ./main_experiments/results/nohup_ovo_qwen3vl_attention_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+Generate plots later from a saved result directory.
+
+```bash
+python analysis/plot_recent_frame_saliency.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset20_20260415_141804
 ```
 
 siglip similarity test.
