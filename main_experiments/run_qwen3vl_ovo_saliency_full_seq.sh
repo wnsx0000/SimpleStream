@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sequential full-subset saliency runs for Qwen3-VL:
-# 1) SigLIP similarity
-# 2) question_prefill attention
+# 1) question_prefill attention
+# 2) SigLIP similarity
 # 3) first_token attention
 
 set -euo pipefail
@@ -18,6 +18,8 @@ RECENT_FRAMES_ONLY="${RECENT_FRAMES_ONLY:-4}"
 CHUNK_DURATION="${CHUNK_DURATION:-1.0}"
 FPS="${FPS:-1.0}"
 MAX_ANALYSIS_FRAMES="${MAX_ANALYSIS_FRAMES:-12}"
+ANALYSIS_SCOPE="${ANALYSIS_SCOPE:-full}"
+MAX_SAMPLES_PER_SUBSET="${MAX_SAMPLES_PER_SUBSET:-}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
 BATCH_TAG="${BATCH_TAG:-$(date +%Y%m%d_%H%M%S)}"
 
@@ -28,34 +30,45 @@ run_case() {
     local similarity_backends="$2"
     local attention_modes="$3"
     local result_dir="${RESULT_ROOT}/ovo_qwen3vl_frame_saliency_full_${case_name}_${BATCH_TAG}"
+    local cmd=(
+        "${PYTHON_BIN}" main_experiments/eval_qwen3vl_ovo_test1.py
+        --model_path "${MODEL_PATH}"
+        --anno_path "${ANNO_PATH}"
+        --chunked_dir "${CHUNKED_DIR}"
+        --result_dir "${result_dir}"
+        --analysis_scope "${ANALYSIS_SCOPE}"
+        --recent_frames_only "${RECENT_FRAMES_ONLY}"
+        --chunk_duration "${CHUNK_DURATION}"
+        --fps "${FPS}"
+        --max_analysis_frames "${MAX_ANALYSIS_FRAMES}"
+        --similarity_backends "${similarity_backends}"
+        --attention_modes "${attention_modes}"
+        --attn_implementation "${ATTN_IMPLEMENTATION}"
+    )
+
+    if [[ -n "${MAX_SAMPLES_PER_SUBSET}" ]]; then
+        cmd+=(--max_samples_per_subset "${MAX_SAMPLES_PER_SUBSET}")
+    fi
 
     echo
     echo "============================================================"
     echo "Starting ${case_name}"
     echo "Result dir: ${result_dir}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+    echo "Analysis scope=${ANALYSIS_SCOPE}"
+    if [[ -n "${MAX_SAMPLES_PER_SUBSET}" ]]; then
+        echo "Max samples per subset=${MAX_SAMPLES_PER_SUBSET}"
+    fi
     echo "============================================================"
 
     HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}" \
     TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}" \
     HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}" \
-    "${PYTHON_BIN}" main_experiments/eval_qwen3vl_ovo_test1.py \
-        --model_path "${MODEL_PATH}" \
-        --anno_path "${ANNO_PATH}" \
-        --chunked_dir "${CHUNKED_DIR}" \
-        --result_dir "${result_dir}" \
-        --analysis_scope full \
-        --recent_frames_only "${RECENT_FRAMES_ONLY}" \
-        --chunk_duration "${CHUNK_DURATION}" \
-        --fps "${FPS}" \
-        --max_analysis_frames "${MAX_ANALYSIS_FRAMES}" \
-        --similarity_backends "${similarity_backends}" \
-        --attention_modes "${attention_modes}" \
-        --attn_implementation "${ATTN_IMPLEMENTATION}"
+    "${cmd[@]}"
 }
 
-run_case "siglip" "siglip" ""
 run_case "question_prefill" "" "question_prefill"
+run_case "siglip" "siglip" ""
 run_case "first_token" "" "first_token"
 
 echo
