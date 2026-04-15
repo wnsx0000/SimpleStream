@@ -21,7 +21,11 @@ from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 DISPLAY_LAYER_COUNT = 5
 QUESTION_PREFILL_FRAME_FRAME_AVERAGE_SHAPE = (64, 64)
 QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE = (32, 64)
-TASK_PLOT_ORDER = [*BACKWARD_TASKS, *REAL_TIME_TASKS]
+EXCLUDED_PLOT_TASKS = frozenset({"HLD"})
+TASK_PLOT_ORDER = [
+    *[task for task in BACKWARD_TASKS if task not in EXCLUDED_PLOT_TASKS],
+    *REAL_TIME_TASKS,
+]
 ATTENTION_METRIC_SPECS = (
     ("question_prefill_attention", "question_prefill", "Question Prefill Attention"),
     ("first_token_attention", "first_token", "First Token Attention"),
@@ -61,6 +65,10 @@ def records_for_split(records: list[dict[str, Any]], split_name: str) -> list[di
     return [record for record in records if str(record.get("split", "")) == split_name]
 
 
+def filter_excluded_tasks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if str(record.get("task", "")) not in EXCLUDED_PLOT_TASKS]
+
+
 def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_COUNT) -> list[int]:
     total_count = int(total_count)
     target_count = int(target_count)
@@ -87,38 +95,6 @@ def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[n
     if sampled_indices.size < 1:
         return None, None
     return sampled_indices, values[sampled_indices]
-
-
-def interpolate_layer_percentiles(
-    records: list[dict[str, Any]],
-    metric_name: str,
-    bins: int = 20,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    stacked = []
-    display_indices: np.ndarray | None = None
-    target_x = np.linspace(0.0, 1.0, bins)
-    for record in valid_records(records):
-        metric = record.get("metrics", {}).get(metric_name)
-        if not metric:
-            continue
-        layer_indices, layer_percentiles = normalized_metric_layer_array(metric, "layer_attention_percentiles")
-        if layer_indices is None or layer_percentiles is None:
-            continue
-        if layer_percentiles.ndim != 2 or layer_percentiles.shape[1] < 1:
-            continue
-        if display_indices is None:
-            display_indices = layer_indices
-        if layer_percentiles.shape[0] != display_indices.shape[0] or not np.array_equal(layer_indices, display_indices):
-            continue
-        source_x = np.linspace(0.0, 1.0, layer_percentiles.shape[1])
-        interpolated = np.stack(
-            [np.interp(target_x, source_x, layer_values) for layer_values in layer_percentiles],
-            axis=0,
-        )
-        stacked.append(interpolated)
-    if not stacked:
-        return None, None
-    return display_indices, np.stack(stacked, axis=0).mean(axis=0)
 
 
 def ordered_task_names(summary: dict[str, Any]) -> list[str]:
@@ -249,6 +225,56 @@ def plot_attention_metric_line(
     plt.close(fig)
 
 
+def plot_attention_metric_line_pooled_only(
+    summary: dict[str, Any],
+    metric_name: str,
+    metric_title: str,
+    file_prefix: str,
+    field_suffix: str,
+    field_name: str,
+    plot_title: str,
+    y_label: str,
+    plots_dir: Path,
+) -> None:
+    layer_indices, lines = collect_metric_lines(summary, metric_name, field_name)
+    if layer_indices is None or not lines:
+        return
+
+    pooled_order = ("backward", "realtime", "total")
+    pooled_lines = {label: values for label, values in lines if label in {"total", "backward", "realtime"}}
+    if not pooled_lines:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    style_map = line_styles()
+    pooled_label_map = {
+        "total": "Total",
+        "backward": "Backward",
+        "realtime": "Real-time",
+    }
+    for label in pooled_order:
+        values = pooled_lines.get(label)
+        if values is None:
+            continue
+        ax.plot(
+            layer_indices,
+            values,
+            label=pooled_label_map[label],
+            **style_map[label],
+        )
+
+    ax.set_title(f"{metric_title}: {plot_title} (Total / Backward / Real-time)")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(y_label)
+    ax.set_xticks(layer_indices)
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+    ax.legend(ncol=3, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(plots_dir / f"{file_prefix}_{field_suffix}_pooled.png", dpi=200)
+    plt.close(fig)
+
+
 def plot_attention_line_plots(summary: dict[str, Any], plots_dir: Path) -> None:
     plots_dir = ensure_dir(plots_dir)
     for metric_name, file_prefix, metric_title in ATTENTION_METRIC_SPECS:
@@ -266,40 +292,17 @@ def plot_attention_line_plots(summary: dict[str, Any], plots_dir: Path) -> None:
                 y_label=y_label,
                 plots_dir=plots_dir,
             )
-
-
-def plot_layer_heatmaps(records: list[dict[str, Any]], plots_dir: Path) -> None:
-    matrices = []
-    labels = []
-    layer_index_sets = []
-    for metric_name, label in (
-        ("question_prefill_attention", "Question Prefill"),
-        ("first_token_attention", "First Token"),
-    ):
-        layer_indices, matrix = interpolate_layer_percentiles(records, metric_name)
-        if layer_indices is not None and matrix is not None:
-            matrices.append(matrix)
-            labels.append(label)
-            layer_index_sets.append(layer_indices)
-    if not matrices:
-        return
-
-    fig, axes = plt.subplots(len(matrices), 1, figsize=(12, 4.5 * len(matrices)), squeeze=False)
-    for ax, matrix, label, layer_indices in zip(axes[:, 0], matrices, labels, layer_index_sets):
-        im = ax.imshow(matrix, aspect="auto", origin="lower", vmin=0.0, vmax=1.0, cmap="viridis")
-        ax.set_title(f"{label}: Layer-wise Percentile Heatmap")
-        ax.set_ylabel("Layer")
-        ax.set_xlabel("Relative Frame Position")
-        ax.set_xticks(np.linspace(0, matrix.shape[1] - 1, 5))
-        ax.set_xticklabels([f"{value:.2f}" for value in np.linspace(0.0, 1.0, 5)])
-        ax.set_yticks(np.arange(layer_indices.shape[0]))
-        ax.set_yticklabels([str(int(index)) for index in layer_indices])
-        recent_start = matrix.shape[1] * 0.75
-        ax.axvspan(recent_start, matrix.shape[1] - 0.5, facecolor="white", alpha=0.12, edgecolor="none")
-        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    fig.tight_layout()
-    fig.savefig(plots_dir / "layerwise_percentile_heatmaps.png", dpi=200)
-    plt.close(fig)
+            plot_attention_metric_line_pooled_only(
+                summary,
+                metric_name=metric_name,
+                metric_title=metric_title,
+                file_prefix=file_prefix,
+                field_suffix=field_suffix,
+                field_name=field_name,
+                plot_title=plot_title,
+                y_label=y_label,
+                plots_dir=plots_dir,
+            )
 
 
 def to_numpy_array(value: Any) -> np.ndarray | None:
@@ -411,6 +414,28 @@ def apply_relative_ticks(ax: Any, *, width: int, height: int, mode: str) -> None
         ax.set_yticklabels([f"{value:.2f}" for value in np.linspace(0.0, 1.0, len(y_positions))])
 
 
+def build_emphasized_heatmap_norm(values: np.ndarray) -> mcolors.Normalize:
+    finite_values = np.asarray(values, dtype=np.float64)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size < 1:
+        return mcolors.Normalize(vmin=0.0, vmax=1.0, clip=True)
+
+    vmin = float(finite_values.min())
+    vmax = float(finite_values.max())
+    if abs(vmax - vmin) < 1e-12:
+        vmax = vmin + 1e-12
+
+    robust_vmax = float(np.percentile(finite_values, 99.5))
+    if robust_vmax > vmin + 1e-12:
+        vmax = min(vmax, robust_vmax)
+
+    if np.all(finite_values >= 0.0):
+        return mcolors.PowerNorm(gamma=0.35, vmin=max(0.0, vmin), vmax=vmax, clip=True)
+
+    linthresh = max((vmax - vmin) / 100.0, 1e-8)
+    return mcolors.SymLogNorm(linthresh=linthresh, vmin=vmin, vmax=vmax, base=10.0, clip=True)
+
+
 def make_example_label(payload: dict[str, Any], fallback: str) -> str:
     task = payload.get("task")
     sample_id = payload.get("id")
@@ -449,11 +474,7 @@ def render_question_prefill_map_panels(
     finite_values = maps[np.isfinite(maps)]
     if finite_values.size < 1:
         return
-    vmin = float(finite_values.min())
-    vmax = float(finite_values.max())
-    if abs(vmax - vmin) < 1e-12:
-        vmax = vmin + 1e-12
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    norm = build_emphasized_heatmap_norm(finite_values)
 
     fig, axes = plt.subplots(1, maps.shape[0], figsize=(4.6 * maps.shape[0], 5.2), squeeze=False)
     axes_row = list(axes[0])
@@ -567,6 +588,8 @@ def plot_question_prefill_attention_map_averages(payloads: list[dict[str, Any]],
 
 def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str, Any] | None = None) -> None:
     payload = torch.load(example_path, map_location="cpu") if payload is None else payload
+    if str(payload.get("task", "")) in EXCLUDED_PLOT_TASKS:
+        return
     example_key = example_path.stem
     example_dir = ensure_dir(plots_dir / "examples" / example_key)
     metrics = payload.get("metrics", {})
@@ -585,7 +608,13 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
             dtype=np.int64,
         )
         fig, ax = plt.subplots(figsize=(11, 5))
-        im = ax.imshow(matrix, aspect="auto", origin="lower", cmap="magma")
+        im = ax.imshow(
+            matrix,
+            aspect="auto",
+            origin="lower",
+            cmap="magma",
+            norm=build_emphasized_heatmap_norm(matrix),
+        )
         ax.set_title(f"{title} Attention Heatmap: {example_key}")
         ax.set_xlabel("Frame Index")
         ax.set_ylabel("Layer")
@@ -598,7 +627,7 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
         selected_recent = set(int(index) for index in metrics[metric_name].get("recent_frame_indices_within_attention", []))
         for local_index in selected_recent:
             ax.axvline(local_index, color="white", linestyle="--", linewidth=0.8, alpha=0.4)
-        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02, label="Attention Score")
         fig.tight_layout()
         fig.savefig(example_dir / f"{metric_name}_heatmap.png", dpi=200)
         plt.close(fig)
@@ -653,7 +682,10 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
 def load_example_payloads(examples_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
     payloads: list[tuple[Path, dict[str, Any]]] = []
     for example_path in sorted(examples_dir.glob("*.pt")):
-        payloads.append((example_path, torch.load(example_path, map_location="cpu")))
+        payload = torch.load(example_path, map_location="cpu")
+        if str(payload.get("task", "")) in EXCLUDED_PLOT_TASKS:
+            continue
+        payloads.append((example_path, payload))
     return payloads
 
 
@@ -664,19 +696,16 @@ def generate_top_level_plots(records: list[dict[str, Any]], plots_dir: Path) -> 
 
     summary = build_experiment_summary(records, config={})
     plot_attention_line_plots(summary, plots_dir)
-    plot_layer_heatmaps(records, plots_dir)
 
 
 def generate_plots(result_dir: str | Path) -> None:
     result_dir = Path(result_dir)
-    records = load_jsonl(result_dir / "records.jsonl")
+    records = filter_excluded_tasks(load_jsonl(result_dir / "records.jsonl"))
     plots_dir = result_dir / "plots"
     if not records:
         return
 
     generate_top_level_plots(records, plots_dir)
-    for split_name in ("backward", "realtime"):
-        plot_layer_heatmaps(records_for_split(records, split_name), ensure_dir(plots_dir / split_name))
 
     examples_dir = result_dir / "examples"
     if not examples_dir.exists():

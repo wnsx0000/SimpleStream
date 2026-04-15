@@ -50,6 +50,9 @@ from main_experiments.eval_qwen3vl_ovo_saliency_common import (
 
 MODEL_LABEL = "Qwen3-VL-SigLIP-Top4"
 EXCLUDED_FORWARD_TASKS = ("REC", "SSR", "CRR")
+EXCLUDED_BACKWARD_TASKS = frozenset({"HLD"})
+EVAL_BACKWARD_TASKS = [task for task in BACKWARD_TASKS if task not in EXCLUDED_BACKWARD_TASKS]
+EVAL_TASK_SET = frozenset([*EVAL_BACKWARD_TASKS, *REAL_TIME_TASKS])
 TOP_K_FRAMES = 4
 
 
@@ -58,7 +61,7 @@ def make_ovo_key(item: dict[str, Any]) -> str:
 
 
 def infer_split_name(task: str) -> str:
-    if task in BACKWARD_TASKS:
+    if task in EVAL_BACKWARD_TASKS:
         return "backward"
     if task in REAL_TIME_TASKS:
         return "realtime"
@@ -95,6 +98,8 @@ def load_checkpoint_state(path: str) -> tuple[list[dict[str, Any]], list[dict[st
 
     for raw in records:
         item = strip_internal_fields(raw)
+        if str(item.get("task", "")) not in EVAL_TASK_SET:
+            continue
         key = raw.get("_key")
         if not isinstance(key, str) or not key:
             key = make_ovo_key(item)
@@ -131,6 +136,8 @@ def merge_shard_results(result_dir: str, num_processes: int) -> tuple[list[dict[
         records, _ = load_jsonl_results(path)
         for raw in records:
             item = strip_internal_fields(raw)
+            if str(item.get("task", "")) not in EVAL_TASK_SET:
+                continue
             key = raw.get("_key")
             if not isinstance(key, str) or not key:
                 key = make_ovo_key(item)
@@ -207,7 +214,7 @@ def build_eval_summary(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     split_specs = (
-        ("backward", "Backward Tracing", BACKWARD_TASKS, backward_results),
+        ("backward", "Backward Tracing", EVAL_BACKWARD_TASKS, backward_results),
         ("realtime", "Real-time Perception", REAL_TIME_TASKS, realtime_results),
     )
 
@@ -503,7 +510,7 @@ def main() -> None:
     rng = random.Random(args.seed)
     backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
         annotations,
-        BACKWARD_TASKS,
+        EVAL_BACKWARD_TASKS,
         rng,
         max_samples_per_split=split_sample_cap,
         max_samples_per_subset=args.max_samples_per_subset,
@@ -520,6 +527,8 @@ def main() -> None:
     accelerator.print(f"OVO-Bench SigLIP Top-4 Evaluation ({MODEL_LABEL})")
     accelerator.print(f"{'=' * 60}")
     accelerator.print(f"Backward: {len(backward_anno)}, Realtime: {len(realtime_anno)}")
+    if EXCLUDED_BACKWARD_TASKS:
+        accelerator.print(f"Excluded backward tasks: {', '.join(sorted(EXCLUDED_BACKWARD_TASKS))}")
     accelerator.print(f"Excluded forward tasks: {', '.join(EXCLUDED_FORWARD_TASKS)}")
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
@@ -535,7 +544,7 @@ def main() -> None:
         accelerator.print(f"Sampling: up to {split_sample_cap} per split")
     else:
         accelerator.print("Sampling: full split")
-    accelerator.print(f"Backward subsets: {format_task_counts(BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
+    accelerator.print(f"Backward subsets: {format_task_counts(EVAL_BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
     accelerator.print(f"Realtime subsets: {format_task_counts(REAL_TIME_TASKS, realtime_selected_counts, realtime_available_counts)}")
     accelerator.print(f"{'=' * 60}\n")
 
@@ -620,6 +629,7 @@ def main() -> None:
             "max_samples_per_split": split_sample_cap,
             "max_samples_per_subset": args.max_samples_per_subset,
             "seed": args.seed,
+            "excluded_backward_tasks": sorted(EXCLUDED_BACKWARD_TASKS),
             "excluded_forward_tasks": list(EXCLUDED_FORWARD_TASKS),
             "sampling_counts": {
                 "backward": {

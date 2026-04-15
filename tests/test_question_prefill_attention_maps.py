@@ -25,6 +25,27 @@ from lib.frame_saliency_qwen3 import (  # noqa: E402
 
 
 class QuestionPrefillAttentionMapTests(unittest.TestCase):
+    @staticmethod
+    def _synthetic_attention_metric(offset: float) -> dict[str, object]:
+        base = np.asarray(
+            [
+                [1.0e-10, 2.0e-10, 4.0e-10],
+                [1.5e-10, 3.0e-10, 6.0e-10],
+                [2.0e-10, 4.0e-10, 8.0e-10],
+            ],
+            dtype=np.float32,
+        )
+        return {
+            "recent4_mean_percentile": 0.25 + offset,
+            "recent4_top4_overlap": 0.10 + offset,
+            "layer_recent4_mean_percentile": [0.20 + offset, 0.30 + offset, 0.40 + offset],
+            "layer_recent4_top4_overlap": [0.05 + offset, 0.10 + offset, 0.15 + offset],
+            "display_layer_indices": [0, 12, 24],
+            "layer_attention_scores": (base + np.float32(offset * 1.0e-4)).tolist(),
+            "attention_frame_indices": [10, 20, 30],
+            "recent_frame_indices_within_attention": [1, 2],
+        }
+
     def test_allocate_proportional_bin_counts(self) -> None:
         counts = [4, 8, 12]
         bins = allocate_proportional_bin_counts(counts, max_bins=9)
@@ -133,6 +154,92 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
             self.assertTrue(
                 (result_dir / "plots" / "examples" / "sample" / "question_prefill_question_frame_maps.png").exists()
             )
+
+    def test_plotting_filters_hld_and_generates_pooled_line_plots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result_dir = Path(tmp_dir)
+            examples_dir = result_dir / "examples"
+            examples_dir.mkdir(parents=True, exist_ok=True)
+
+            records = [
+                {
+                    "_key": "ASI:1",
+                    "split": "backward",
+                    "task": "ASI",
+                    "id": 1,
+                    "metrics": {
+                        "question_prefill_attention": self._synthetic_attention_metric(0.00),
+                    },
+                },
+                {
+                    "_key": "OCR:2",
+                    "split": "realtime",
+                    "task": "OCR",
+                    "id": 2,
+                    "metrics": {
+                        "question_prefill_attention": self._synthetic_attention_metric(0.05),
+                    },
+                },
+                {
+                    "_key": "HLD:3",
+                    "split": "backward",
+                    "task": "HLD",
+                    "id": 3,
+                    "metrics": {
+                        "question_prefill_attention": self._synthetic_attention_metric(0.50),
+                    },
+                },
+            ]
+            with (result_dir / "records.jsonl").open("w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+
+            allowed_payload = {
+                "split": "backward",
+                "task": "ASI",
+                "id": 1,
+                "question": "allowed sample",
+                "recent_frame_indices": [1, 2],
+                "metrics": {
+                    "question_prefill_attention": self._synthetic_attention_metric(0.0),
+                },
+                "question_prefill_attention_maps": {
+                    "frame_frame_maps": torch.linspace(
+                        1.0e-10,
+                        9.0e-10,
+                        steps=3 * 3 * 3,
+                        dtype=torch.float32,
+                    ).reshape(3, 3, 3),
+                    "question_frame_maps": torch.linspace(
+                        1.0e-10,
+                        6.0e-10,
+                        steps=3 * 2 * 3,
+                        dtype=torch.float32,
+                    ).reshape(3, 2, 3),
+                    "display_layer_indices": [0, 12, 24],
+                    "attention_frame_indices": [10, 20, 30],
+                    "frame_bin_slices": [[0, 1], [1, 2], [2, 3]],
+                    "frame_bin_labels": ["10", "20", "30"],
+                    "question_bin_labels": ["q0", "q1"],
+                },
+            }
+            filtered_payload = {
+                **allowed_payload,
+                "task": "HLD",
+                "id": 3,
+            }
+            torch.save(allowed_payload, examples_dir / "asi_sample.pt")
+            torch.save(filtered_payload, examples_dir / "hld_sample.pt")
+
+            generate_plots(result_dir)
+
+            self.assertTrue((result_dir / "plots" / "question_prefill_percentile_mean.png").exists())
+            self.assertTrue((result_dir / "plots" / "question_prefill_percentile_mean_pooled.png").exists())
+            self.assertFalse((result_dir / "plots" / "layerwise_percentile_heatmaps.png").exists())
+            self.assertTrue(
+                (result_dir / "plots" / "examples" / "asi_sample" / "question_prefill_attention_heatmap.png").exists()
+            )
+            self.assertFalse((result_dir / "plots" / "examples" / "hld_sample").exists())
 
 
 if __name__ == "__main__":

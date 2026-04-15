@@ -17,6 +17,9 @@ from lib.frame_saliency_qwen3 import build_experiment_summary, save_json, slugif
 from lib.recent_window_eval import build_ovo_prompt, load_jsonl_results
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 
+EXCLUDED_BACKWARD_TASKS = frozenset({"HLD"})
+EVAL_BACKWARD_TASKS = [task for task in BACKWARD_TASKS if task not in EXCLUDED_BACKWARD_TASKS]
+
 
 @dataclass
 class SaliencyExperimentConfig:
@@ -186,7 +189,7 @@ def run_saliency_experiment(
     rng = random.Random(config.seed)
     backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
         annotations,
-        BACKWARD_TASKS,
+        EVAL_BACKWARD_TASKS,
         rng,
         max_samples_per_split=split_sample_cap,
         max_samples_per_subset=config.max_samples_per_subset,
@@ -206,6 +209,9 @@ def run_saliency_experiment(
     examples_dir.mkdir(parents=True, exist_ok=True)
 
     existing_records, done_keys = load_jsonl_results(str(records_path))
+    existing_records = [
+        record for record in existing_records if str(record.get("task", "")) not in EXCLUDED_BACKWARD_TASKS
+    ]
     saved_examples_by_task = Counter(
         str(record.get("task", ""))
         for record in existing_records
@@ -222,6 +228,8 @@ def run_saliency_experiment(
     print("=" * 60)
     print(f"Backward: {len(backward_anno)}")
     print(f"Realtime: {len(realtime_anno)}")
+    if EXCLUDED_BACKWARD_TASKS:
+        print(f"Excluded backward tasks: {', '.join(sorted(EXCLUDED_BACKWARD_TASKS))}")
     print(f"Similarity: {config.similarity_backends or 'disabled'}")
     print(f"Attention: {config.attention_modes or 'disabled'}")
     print(f"Scope: {config.analysis_scope}")
@@ -231,7 +239,7 @@ def run_saliency_experiment(
         print(f"Sampling: up to {split_sample_cap} per split")
     else:
         print("Sampling: full split")
-    print(f"Backward subsets: {format_task_counts(BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
+    print(f"Backward subsets: {format_task_counts(EVAL_BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
     print(f"Realtime subsets: {format_task_counts(REAL_TIME_TASKS, realtime_selected_counts, realtime_available_counts)}")
     print(f"Result Dir: {result_dir}")
     print("=" * 60 + "\n")
@@ -335,6 +343,7 @@ def run_saliency_experiment(
         "analysis_scope": config.analysis_scope,
         "max_samples_per_split": split_sample_cap,
         "max_samples_per_subset": config.max_samples_per_subset,
+        "excluded_backward_tasks": sorted(EXCLUDED_BACKWARD_TASKS),
         "similarity_backends": list(config.similarity_backends),
         "attention_modes": list(config.attention_modes),
         "save_example_matrices": config.save_example_matrices,
