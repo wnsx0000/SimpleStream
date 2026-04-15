@@ -15,6 +15,7 @@ from lib.recent_window_eval import decode_video_to_chunks_qwen, select_attention
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
 DISPLAY_LAYER_COUNT = 10
+QUESTION_PREFILL_DISPLAY_LAYER_COUNT = 5
 
 
 def parse_csv_options(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -105,10 +106,29 @@ def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_C
         return []
     if total_count <= target_count:
         return list(range(total_count))
-    return [int(round(x)) for x in np.linspace(0, total_count - 1, target_count)]
+    if target_count == 1:
+        return [0]
+
+    # Keep the selection monotonic while still spreading indices uniformly and
+    # always including the first and last decoder layers.
+    selected: list[int] = []
+    last_index = -1
+    for position in range(target_count):
+        remaining_slots = target_count - position - 1
+        min_index = last_index + 1
+        max_index = total_count - remaining_slots - 1
+        raw_index = int(round(position * (total_count - 1) / float(target_count - 1)))
+        clamped_index = min(max(raw_index, min_index), max_index)
+        selected.append(clamped_index)
+        last_index = clamped_index
+    return selected
 
 
-def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[int]) -> dict[str, Any]:
+def summarize_layerwise_metric(
+    layer_scores: torch.Tensor,
+    recent_indices: list[int],
+    display_layer_count: int = DISPLAY_LAYER_COUNT,
+) -> dict[str, Any]:
     if layer_scores.ndim != 2:
         raise ValueError(f"Expected [layers, frames] scores, got shape={tuple(layer_scores.shape)}")
 
@@ -117,7 +137,7 @@ def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[
         [tie_aware_percentiles(row.tolist()) for row in layer_scores],
         dtype=torch.float32,
     )
-    display_layer_indices = uniform_center_indices(layer_scores.shape[0], DISPLAY_LAYER_COUNT)
+    display_layer_indices = uniform_center_indices(layer_scores.shape[0], display_layer_count)
     display_layer_scores = layer_scores[display_layer_indices]
     display_layer_percentiles = layer_percentiles[display_layer_indices]
     display_layer_recent_mean = [
@@ -710,6 +730,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
                     prefill_scores,
                     recent_indices=attention_recent_indices,
+                    display_layer_count=QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
                 )
                 metrics["question_prefill_attention"]["attention_frame_indices"] = attention_frame_indices
                 metrics["question_prefill_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
@@ -718,7 +739,12 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
                 if save_raw_attentions:
-                    example_payload["raw_question_prefill_attentions"] = prefill_collector.layer_raw_attentions
+                    display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
+                    example_payload["raw_question_prefill_attentions"] = {
+                        int(layer_idx): prefill_collector.layer_raw_attentions[int(layer_idx)]
+                        for layer_idx in display_layer_indices
+                        if int(layer_idx) in prefill_collector.layer_raw_attentions
+                    }
                 del prefill_scores, prefill_collector
                 release_unused_cuda_memory()
 

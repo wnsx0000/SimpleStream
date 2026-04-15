@@ -232,6 +232,7 @@ backward/realtime splits. When `--max_samples_per_subset` is set, it overrides
 the default smoke split cap.
 
 question_prefill test.
+This run saves 5 uniformly spaced decoder layers, including the first and last.
 
 ```bash
 CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_2.py \
