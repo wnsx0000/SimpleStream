@@ -214,7 +214,7 @@ attention maps, plus averages over the saved example subset.
 attention scoring test.
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_2.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -270,24 +270,6 @@ Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
 accuracy, split-level official averages and pooled accuracy, plus both
 `Official Total Avg.` and `Pooled Overall Acc.` for the full run.
 
-siglip top-4 smoke test.
-
-```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_smoke_$(date +%Y%m%d_%H%M%S) \
-    --analysis_scope smoke \
-    --recent_frames_only 4 \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    --max_analysis_frames 12 \
-    --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_smoke_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
-
-Use `--analysis_scope full` to evaluate the full backward/realtime splits.
 Use `--max_samples_per_subset 50` to sample up to 50 examples independently
 from each OVO subset/task within those splits. `--max_frames` is kept as an
 alias of `--max_analysis_frames` for backward compatibility.

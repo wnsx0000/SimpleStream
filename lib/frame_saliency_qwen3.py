@@ -159,7 +159,7 @@ def summarize_layerwise_metric(
     mean_summary = summarize_scalar_metric(mean_scores.tolist(), recent_indices)
 
     num_layers = int(layer_scores.shape[0])
-    tail_layer_indices = sorted(set(range(max(0, num_layers - 4), num_layers)) - set(display_layer_indices))
+    tail_layer_indices = sorted(set(range(max(0, num_layers - 8), num_layers)) - set(display_layer_indices))
     tail_layer_scores = layer_scores[tail_layer_indices] if tail_layer_indices else torch.empty(0, layer_scores.shape[1])
 
     return {
@@ -1001,7 +1001,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
                 )
                 question_prefill_tail_layers = sorted(
-                    set(range(max(0, num_text_layers - 4), num_text_layers)) - set(question_prefill_display_layers)
+                    set(range(max(0, num_text_layers - 8), num_text_layers)) - set(question_prefill_display_layers)
                 )
                 question_only_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,

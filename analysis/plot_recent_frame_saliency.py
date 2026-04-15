@@ -20,7 +20,7 @@ from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 
 DISPLAY_LAYER_COUNT = 5
 QUESTION_PREFILL_FRAME_FRAME_AVERAGE_SHAPE = (64, 64)
-QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE = (32, 64)
+QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE = (64, 64)
 EXCLUDED_PLOT_TASKS = frozenset({"HLD"})
 TASK_PLOT_ORDER = [
     *[task for task in BACKWARD_TASKS if task not in EXCLUDED_PLOT_TASKS],
@@ -348,20 +348,17 @@ def scatter_square_heatmap(
     cmap: str = "viridis",
 ) -> Any:
     rows, cols = matrix.shape
-    yy, xx = np.indices((rows, cols))
-    scatter = ax.scatter(
-        xx.ravel(),
-        yy.ravel(),
-        c=matrix.ravel(),
+    mesh = ax.pcolormesh(
+        np.arange(cols + 1) - 0.5,
+        np.arange(rows + 1) - 0.5,
+        matrix,
         cmap=cmap,
         norm=norm,
-        marker="s",
-        s=square_marker_size((rows, cols)),
-        linewidths=0.0,
+        shading="flat",
     )
     ax.set_xlim(-0.5, cols - 0.5)
     ax.set_ylim(rows - 0.5, -0.5)
-    return scatter
+    return mesh
 
 
 def annotate_frame_boundaries(
@@ -480,9 +477,11 @@ def render_question_prefill_map_panels(
     num_panels = maps.shape[0]
     num_rows = (num_panels + max_cols - 1) // max_cols
     num_cols = min(num_panels, max_cols)
+    panel_width = 4.6
+    panel_height = panel_width
     fig, axes = plt.subplots(
         num_rows, num_cols,
-        figsize=(4.6 * num_cols, 5.2 * num_rows),
+        figsize=(panel_width * num_cols, panel_height * num_rows + 1.0),
         squeeze=False,
     )
     mappable = None
@@ -520,8 +519,11 @@ def render_question_prefill_map_panels(
             if last_row < axes.shape[0] and col_idx < axes.shape[1]:
                 axes[last_row][col_idx].set_visible(False)
 
-    fig.suptitle(figure_title)
-    fig.subplots_adjust(left=0.05, right=0.88, top=0.92, bottom=0.10, wspace=0.30, hspace=0.45)
+    fig.suptitle(figure_title, y=0.98)
+    if mode == "question_frame":
+        fig.subplots_adjust(left=0.05, right=0.88, top=0.92, bottom=0.10, wspace=0.30, hspace=0.8)
+    else:
+        fig.subplots_adjust(left=0.05, right=0.88, top=0.92, bottom=0.10, wspace=0.30, hspace=0.45)
     if mappable is not None:
         cbar_ax = fig.add_axes([0.90, 0.10, 0.015, 0.82])
         fig.colorbar(mappable, cax=cbar_ax, label="Mean Attention Score")
