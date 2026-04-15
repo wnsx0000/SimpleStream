@@ -164,6 +164,23 @@ python scoring/score_ovo_bench.py \
 ## Additional Experiments
 
 <details>
+<summary><b>Qwen3-VL on OVO-Bench</b></summary>
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_recent4 \
+    --recent_frames_only 4 \
+    --chunk_duration 1.0 \
+    --model_device auto \
+    --fps 1.0 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_recent4_full_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+</details>
+
+<details>
 <summary><b>Test 1</b></summary>
 
 Measures whether the `recent4` frames selected by SimpleStream are also salient 
@@ -277,19 +294,18 @@ alias of `--max_analysis_frames` for backward compatibility.
 siglip top-4 subset20 test.
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_subset20_$(date +%Y%m%d_%H%M%S) \
+    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S) \
     --analysis_scope full \
-    --max_samples_per_subset 20 \
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
     --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 </details>
 
