@@ -224,7 +224,7 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --max_analysis_frames 10 \
+    --max_analysis_frames 12 \
     --attention_modes question_prefill \
     --attn_implementation eager \
     > ./main_experiments/results/nohup_ovo_qwen3vl_attention_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
@@ -234,7 +234,7 @@ Generate plots later from a saved result directory.
 
 ```bash
 python analysis/plot_recent_frame_saliency.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset20_20260415_141804
+    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset1_20260415_180521
 ```
 
 siglip similarity test.

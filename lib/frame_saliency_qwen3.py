@@ -158,13 +158,19 @@ def summarize_layerwise_metric(
     mean_scores = layer_scores.mean(dim=0)
     mean_summary = summarize_scalar_metric(mean_scores.tolist(), recent_indices)
 
+    num_layers = int(layer_scores.shape[0])
+    tail_layer_indices = sorted(set(range(max(0, num_layers - 4), num_layers)) - set(display_layer_indices))
+    tail_layer_scores = layer_scores[tail_layer_indices] if tail_layer_indices else torch.empty(0, layer_scores.shape[1])
+
     return {
-        "num_layers_total": int(layer_scores.shape[0]),
+        "num_layers_total": num_layers,
         "display_layer_indices": [int(index) for index in display_layer_indices],
         "layer_attention_scores": display_layer_scores.tolist(),
         "layer_attention_percentiles": display_layer_percentiles.tolist(),
         "layer_recent4_mean_percentile": [float(value) for value in display_layer_recent_mean],
         "layer_recent4_top4_overlap": [float(value) for value in display_layer_overlap],
+        "tail_layer_indices": [int(index) for index in tail_layer_indices],
+        "tail_layer_attention_scores": tail_layer_scores.tolist(),
         "mean_attention_score": mean_summary["frame_scores"],
         "mean_percentile": mean_summary["frame_percentiles"],
         "recent4_mean_percentile": mean_summary["recent4_mean_percentile"],
@@ -989,9 +995,13 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             # Collect layer-wise prefill attention showing which frames the question tokens focus on.
             if "question_prefill" in attention_modes:
                 text_layers = self._get_text_layers()
+                num_text_layers = len(text_layers)
                 question_prefill_display_layers = uniform_center_indices(
-                    len(text_layers),
+                    num_text_layers,
                     QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
+                )
+                question_prefill_tail_layers = sorted(
+                    set(range(max(0, num_text_layers - 4), num_text_layers)) - set(question_prefill_display_layers)
                 )
                 question_only_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,
@@ -1013,7 +1023,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     query_positions=question_only_inputs["question_token_positions"],
                     num_layers=len(text_layers),
                     save_raw=save_raw_attentions,
-                    map_layer_indices=question_prefill_display_layers if map_metadata is not None else None,
+                    map_layer_indices=(
+                        sorted(set(question_prefill_display_layers + question_prefill_tail_layers))
+                        if map_metadata is not None
+                        else None
+                    ),
                     question_prefill_map_metadata=map_metadata,
                 )
                 _prefill_output = self._run_with_collector(
@@ -1039,7 +1053,8 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if save_example_matrices:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
-                    attention_map_payload = prefill_collector.export_question_prefill_attention_maps(display_layer_indices)
+                    export_layer_indices = sorted(set(display_layer_indices) | set(question_prefill_tail_layers))
+                    attention_map_payload = prefill_collector.export_question_prefill_attention_maps(export_layer_indices)
                     if attention_map_payload is not None:
                         example_payload["question_prefill_attention_maps"] = attention_map_payload
                 if save_raw_attentions:

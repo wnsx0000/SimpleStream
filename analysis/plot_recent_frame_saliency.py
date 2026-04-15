@@ -476,10 +476,21 @@ def render_question_prefill_map_panels(
         return
     norm = build_emphasized_heatmap_norm(finite_values)
 
-    fig, axes = plt.subplots(1, maps.shape[0], figsize=(4.6 * maps.shape[0], 5.2), squeeze=False)
-    axes_row = list(axes[0])
+    max_cols = 4
+    num_panels = maps.shape[0]
+    num_rows = (num_panels + max_cols - 1) // max_cols
+    num_cols = min(num_panels, max_cols)
+    fig, axes = plt.subplots(
+        num_rows, num_cols,
+        figsize=(4.6 * num_cols, 5.2 * num_rows),
+        squeeze=False,
+    )
     mappable = None
-    for ax, matrix, layer_idx in zip(axes_row, maps, display_layer_indices):
+    all_axes: list[Any] = []
+    for panel_idx, (matrix, layer_idx) in enumerate(zip(maps, display_layer_indices)):
+        row_idx, col_idx = divmod(panel_idx, max_cols)
+        ax = axes[row_idx][col_idx]
+        all_axes.append(ax)
         mappable = scatter_square_heatmap(ax, matrix, norm=norm)
         ax.set_title(f"Layer {int(layer_idx)}")
         ax.set_xlabel(x_label)
@@ -499,12 +510,21 @@ def render_question_prefill_map_panels(
                 apply_question_ticks(ax, question_bin_labels)
             else:
                 apply_relative_ticks(ax, width=matrix.shape[1], height=matrix.shape[0], mode=mode)
+        if col_idx == 0:
+            ax.set_ylabel(y_label)
 
-    axes_row[0].set_ylabel(y_label)
+    # Hide unused axes in the last row
+    for col_idx in range(num_panels % max_cols or max_cols, max_cols):
+        if num_rows > 1 or num_panels < max_cols:
+            last_row = num_rows - 1
+            if last_row < axes.shape[0] and col_idx < axes.shape[1]:
+                axes[last_row][col_idx].set_visible(False)
+
     fig.suptitle(figure_title)
+    fig.subplots_adjust(left=0.05, right=0.88, top=0.92, bottom=0.10, wspace=0.30, hspace=0.45)
     if mappable is not None:
-        fig.colorbar(mappable, ax=axes_row, fraction=0.025, pad=0.02, label="Mean Attention Score")
-    fig.subplots_adjust(left=0.05, right=0.92, top=0.84, bottom=0.24, wspace=0.28)
+        cbar_ax = fig.add_axes([0.90, 0.10, 0.015, 0.82])
+        fig.colorbar(mappable, cax=cbar_ax, label="Mean Attention Score")
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
 
@@ -603,6 +623,20 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
         layer_indices, matrix = normalized_metric_layer_array(metrics[metric_name], "layer_attention_scores")
         if layer_indices is None or matrix is None:
             continue
+
+        # Merge tail (last-4) layers if available
+        tail_indices = metrics[metric_name].get("tail_layer_indices", [])
+        tail_scores = metrics[metric_name].get("tail_layer_attention_scores", [])
+        if tail_indices and tail_scores:
+            tail_indices_arr = np.asarray(tail_indices, dtype=np.int64)
+            tail_matrix = np.asarray(tail_scores, dtype=matrix.dtype)
+            if tail_matrix.ndim == 2 and tail_matrix.shape[1] == matrix.shape[1]:
+                merged_indices = np.concatenate([layer_indices, tail_indices_arr])
+                merged_matrix = np.concatenate([matrix, tail_matrix], axis=0)
+                sort_order = np.argsort(merged_indices)
+                layer_indices = merged_indices[sort_order]
+                matrix = merged_matrix[sort_order]
+
         x_positions = np.asarray(
             metrics[metric_name].get("attention_frame_indices", list(range(matrix.shape[1]))),
             dtype=np.int64,
@@ -624,11 +658,14 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
         ax.set_xticklabels(tick_labels)
         ax.set_yticks(np.arange(layer_indices.shape[0]))
         ax.set_yticklabels([str(int(index)) for index in layer_indices])
+        # Draw boundary lines between each frame column
+        for col_idx in range(matrix.shape[1] - 1):
+            ax.axvline(col_idx + 0.5, color="white", linewidth=0.4, alpha=0.35)
         selected_recent = set(int(index) for index in metrics[metric_name].get("recent_frame_indices_within_attention", []))
         for local_index in selected_recent:
             ax.axvline(local_index, color="white", linestyle="--", linewidth=0.8, alpha=0.4)
-        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02, label="Attention Score")
-        fig.tight_layout()
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.04, label="Attention Score")
+        fig.subplots_adjust(left=0.06, right=0.88, top=0.92, bottom=0.12)
         fig.savefig(example_dir / f"{metric_name}_heatmap.png", dpi=200)
         plt.close(fig)
 
