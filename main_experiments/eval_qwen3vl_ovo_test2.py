@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import torch
 
 os.environ.setdefault("NCCL_TIMEOUT", "7200")
@@ -31,7 +32,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 from lib.frame_saliency_qwen3 import (
     SiglipFrameEncoder,
-    build_analysis_subset,
     cosine_scores_against_query,
     flatten_chunks,
 )
@@ -350,11 +350,14 @@ def evaluate_siglip_top4_backward_realtime(
     num_sampled_frames = len(frames)
     del chunks
 
-    analysis_frame_indices, _analysis_recent_indices, analysis_sampling_strategy = build_analysis_subset(
-        total_frames=num_sampled_frames,
-        recent_indices=recent_indices,
-        max_analysis_frames=max_analysis_frames,
-    )
+    # Uniform subsampling without recent-anchor bias: recent_frames_only is
+    # only used for metadata (is_recent), not for candidate pool selection.
+    if num_sampled_frames <= max_analysis_frames:
+        analysis_frame_indices = list(range(num_sampled_frames))
+        analysis_sampling_strategy = "all_frames"
+    else:
+        analysis_frame_indices = np.linspace(0, num_sampled_frames - 1, max_analysis_frames, dtype=int).tolist()
+        analysis_sampling_strategy = "uniform"
     if not analysis_frame_indices:
         raise ValueError(f"No analysis frames selected for video: {video_path}")
 
