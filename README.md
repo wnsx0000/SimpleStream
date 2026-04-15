@@ -181,8 +181,9 @@ with equal task weight. Metric summaries now include both `*_mean` and `*_std`
 fields. Aggregate plots are written both to the
 pooled `plots/` directory and to split-specific directories under
 `plots/backward/` and `plots/realtime/`.
-If the sampled window is longer than `--max_analysis_frames`, attention is
-computed on a uniform subsample while keeping the recent frames in the set.
+If the sampled window is longer than `--max_analysis_frames`, SigLIP similarity
+and attention are computed on a uniform subsample while keeping the recent
+frames in the set.
 
 <!-- CUDA_LAUNCH_BLOCKING=1  -->
 
@@ -213,7 +214,7 @@ the default smoke split cap.
 question_prefill test.
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -233,7 +234,7 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.
 siglip test.
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \

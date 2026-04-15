@@ -39,6 +39,20 @@ def records_for_split(records: list[dict[str, Any]], split_name: str) -> list[di
     return [record for record in records if str(record.get("split", "")) == split_name]
 
 
+def scalar_metric_recent_indices(record: dict[str, Any], metric: dict[str, Any]) -> list[int]:
+    subset_recent = metric.get("recent_frame_indices_within_analysis")
+    if subset_recent is not None:
+        return [int(index) for index in subset_recent]
+    return [int(index) for index in record.get("recent_frame_indices", [])]
+
+
+def scalar_metric_frame_indices(metric: dict[str, Any], field: str) -> np.ndarray:
+    metric_frame_indices = metric.get("analysis_frame_indices")
+    if metric_frame_indices is not None:
+        return np.asarray(metric_frame_indices, dtype=np.int64)
+    return np.arange(len(metric.get(field, [])), dtype=np.int64)
+
+
 def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: str) -> list[float]:
     values: list[float] = []
     for record in valid_records(records):
@@ -50,7 +64,7 @@ def metric_recent_frame_percentiles(records: list[dict[str, Any]], metric_name: 
             recent_indices = metric.get("recent_frame_indices_within_attention", [])
         else:
             frame_values = metric.get("frame_percentiles", [])
-            recent_indices = record.get("recent_frame_indices", [])
+            recent_indices = scalar_metric_recent_indices(record, metric)
         values.extend(float(frame_values[idx]) for idx in recent_indices if 0 <= idx < len(frame_values))
     return values
 
@@ -311,12 +325,12 @@ def plot_example_payload(example_path: Path, plots_dir: Path) -> None:
     example_dir = ensure_dir(plots_dir / "examples" / example_key)
 
     metrics = payload.get("metrics", {})
-    frame_indices = np.arange(len(frame_rows))
     line_plotted = False
     fig, ax = plt.subplots(figsize=(11, 5))
     if "siglip_similarity" in metrics:
+        siglip_x = scalar_metric_frame_indices(metrics["siglip_similarity"], "frame_scores")
         ax.plot(
-            frame_indices,
+            siglip_x,
             metrics["siglip_similarity"]["frame_scores"],
             label="SigLIP Frame-Question Similarity",
         )

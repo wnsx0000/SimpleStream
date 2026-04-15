@@ -510,13 +510,32 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             "recent_chunk_ids": recent_chunk_ids,
         } if (save_example_matrices or save_raw_attentions) else {}
 
+        # Compute one shared analysis subset so SigLIP and attention use the same
+        # frame selection policy when max_analysis_frames is active.
+        analysis_frame_indices, analysis_sampling_strategy = select_attention_frame_indices(
+            total_frames=num_sampled_frames,
+            recent_indices=recent_indices,
+            max_analysis_frames=max_analysis_frames,
+        )
+        analysis_index_lookup = {frame_idx: local_idx for local_idx, frame_idx in enumerate(analysis_frame_indices)}
+        analysis_recent_indices = [
+            analysis_index_lookup[frame_idx]
+            for frame_idx in recent_indices
+            if frame_idx in analysis_index_lookup
+        ]
+
         # If requested, compute SigLIP frame-text similarity and summarize it over recent frames.
         if "siglip" in similarity_backends:
             siglip_encoder = self.get_siglip_encoder()
-            siglip_features = siglip_encoder.encode_frames(frames)
+            analysis_frames = [frames[frame_idx] for frame_idx in analysis_frame_indices]
+            siglip_features = siglip_encoder.encode_frames(analysis_frames)
+            del analysis_frames
             siglip_question_feature = siglip_encoder.encode_text(similarity_text or "")
             siglip_scores = cosine_scores_against_query(siglip_features, siglip_question_feature).tolist()
-            metrics["siglip_similarity"] = summarize_scalar_metric(siglip_scores, recent_indices)
+            metrics["siglip_similarity"] = summarize_scalar_metric(siglip_scores, analysis_recent_indices)
+            metrics["siglip_similarity"]["analysis_frame_indices"] = analysis_frame_indices
+            metrics["siglip_similarity"]["recent_frame_indices_within_analysis"] = analysis_recent_indices
+            metrics["siglip_similarity"]["analysis_sampling_strategy"] = analysis_sampling_strategy
             if save_example_matrices:
                 example_payload["siglip_similarity_query"] = str(similarity_text or "")
             del siglip_features, siglip_question_feature, siglip_scores
@@ -527,17 +546,10 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         attention_recent_indices: list[int] = recent_indices
         attention_sampling_strategy = "all_frames"
         if attention_modes:
-            attention_frame_indices, attention_sampling_strategy = select_attention_frame_indices(
-                total_frames=num_sampled_frames,
-                recent_indices=recent_indices,
-                max_analysis_frames=max_analysis_frames,
-            )
-            attention_index_lookup = {frame_idx: local_idx for local_idx, frame_idx in enumerate(attention_frame_indices)}
-            attention_recent_indices = [
-                attention_index_lookup[frame_idx]
-                for frame_idx in recent_indices
-                if frame_idx in attention_index_lookup
-            ]
+            attention_frame_indices = analysis_frame_indices
+            attention_recent_indices = analysis_recent_indices
+            attention_sampling_strategy = analysis_sampling_strategy
+            attention_index_lookup = analysis_index_lookup
 
             # Encode only the selected attention frames so max_analysis_frames reduces vision memory too.
             attention_frames = [frames[frame_idx] for frame_idx in attention_frame_indices]
