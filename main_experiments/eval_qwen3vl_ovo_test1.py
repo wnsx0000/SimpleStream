@@ -10,6 +10,7 @@ on the backward and realtime OVO-Bench splits using:
 from __future__ import annotations
 
 import argparse
+import gc
 from collections import Counter
 import json
 import os
@@ -316,6 +317,10 @@ def main() -> None:
                         "video_path": video_path,
                         "error": str(exc),
                     }
+                    # Ensure GPU memory is freed after OOM or other errors
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 append_record(handle, output)
                 all_records.append(output)

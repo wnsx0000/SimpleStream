@@ -104,8 +104,7 @@ def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_C
         return []
     if total_count <= target_count:
         return list(range(total_count))
-    bins = np.array_split(np.arange(total_count), target_count)
-    return [int(chunk[len(chunk) // 2]) for chunk in bins if len(chunk) > 0]
+    return [int(round(x)) for x in np.linspace(0, total_count - 1, target_count)]
 
 
 def summarize_layerwise_metric(layer_scores: torch.Tensor, recent_indices: list[int]) -> dict[str, Any]:
@@ -230,7 +229,7 @@ class LayerwiseFrameAttentionCollector:
         self.layer_raw_attentions: dict[int, torch.Tensor] = {}
 
     def make_hook(self, layer_idx: int):
-        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+        def hook(_module: Any, _inputs: Any, output: Any):
             if not isinstance(output, (tuple, list)) or len(output) < 2 or output[1] is None:
                 raise RuntimeError(
                     "Qwen3 text self-attention did not return attention weights. "
@@ -255,6 +254,11 @@ class LayerwiseFrameAttentionCollector:
 
             if self.save_raw:
                 self.layer_raw_attentions[layer_idx] = attn_weights[0].detach().float().cpu()
+
+            # Return modified output with attention weights replaced by None to
+            # immediately free the large [batch, heads, seq_len, seq_len] GPU tensor
+            # instead of keeping it alive through the rest of the decoder layer.
+            return (output[0], None) + output[2:] if len(output) > 2 else (output[0], None)
 
         return hook
 
@@ -350,8 +354,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
 
     def get_siglip_encoder(self) -> SiglipFrameEncoder:
         if self._siglip_encoder is None:
-            visual_device = self._get_visual_device()
-            self._siglip_encoder = SiglipFrameEncoder(self.siglip_model_name, visual_device)
+            if torch.cuda.device_count() > 1:
+                siglip_device = torch.device(f"cuda:{torch.cuda.device_count() - 1}")
+            else:
+                siglip_device = self._get_visual_device()
+            self._siglip_encoder = SiglipFrameEncoder(self.siglip_model_name, siglip_device)
         return self._siglip_encoder
 
     def _get_text_layers(self) -> list[Any]:
@@ -554,7 +561,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     num_layers=len(self._get_text_layers()),
                     save_raw=save_raw_attentions,
                 )
-                self._run_with_collector(
+                _prefill_output = self._run_with_collector(
                     prefill_collector,
                     use_cache=False,
                     input_ids=None,
@@ -562,6 +569,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     attention_mask=question_only_inputs["attention_mask"],
                     position_ids=question_only_inputs["position_ids"],
                 )
+                del _prefill_output
                 prefill_scores = prefill_collector.as_tensor()
                 del question_only_inputs
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
@@ -597,19 +605,20 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 prefill_past_key_values = prefill_outputs.past_key_values
                 first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
                 del prefill_outputs
+                release_unused_cuda_memory()
                 decode_collector = LayerwiseFrameAttentionCollector(
                     frame_token_spans=full_prompt_inputs["frame_token_spans"],
                     query_positions=[0],
                     num_layers=len(self._get_text_layers()),
                     save_raw=save_raw_attentions,
                 )
-                self._run_with_collector(
+                _decode_output = self._run_with_collector(
                     decode_collector,
                     use_cache=False,
                     input_ids=first_token[:, None],
                     past_key_values=prefill_past_key_values,
                 )
-                del full_prompt_inputs, prefill_past_key_values
+                del _decode_output, full_prompt_inputs, prefill_past_key_values
                 decode_scores = decode_collector.as_tensor()
                 metrics["first_token_attention"] = summarize_layerwise_metric(
                     decode_scores,

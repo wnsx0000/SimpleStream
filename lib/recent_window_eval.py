@@ -120,6 +120,11 @@ class RecentWindowQAModel:
         }
         if device == "auto":
             model_kwargs["device_map"] = "auto"
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                model_kwargs["max_memory"] = {
+                    i: "20GiB" for i in range(num_gpus)
+                }
         else:
             model_kwargs["device_map"] = str(device)
 

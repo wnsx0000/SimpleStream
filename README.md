@@ -187,7 +187,7 @@ computed on a uniform subsample while keeping the recent frames in the set.
 <!-- CUDA_LAUNCH_BLOCKING=1  -->
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -210,8 +210,30 @@ each OVO subset/task independently (for example `EPM`, `STU`, `OCR`) within the
 backward/realtime splits. When `--max_samples_per_subset` is set, it overrides
 the default smoke split cap.
 
+question_prefill test.
+
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_frame_saliency_subset20_$(date +%Y%m%d_%H%M%S) \
+    --analysis_scope full \
+    --max_samples_per_subset 20 \
+    --recent_frames_only 4 \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --max_analysis_frames 10 \
+    --similarity_backends "" \
+    --attention_modes question_prefill \
+    --attn_implementation eager \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_frame_saliency_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+siglip test.
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -223,7 +245,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test
     --fps 1.0 \
     --max_analysis_frames 12 \
     --similarity_backends siglip \
-    --attention_modes question_prefill \
+    --attention_modes "" \
     --attn_implementation eager \
     > ./main_experiments/results/nohup_ovo_qwen3vl_frame_saliency_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```

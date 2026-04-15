@@ -71,8 +71,7 @@ def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_C
         return []
     if total_count <= target_count:
         return list(range(total_count))
-    bins = np.array_split(np.arange(total_count), target_count)
-    return [int(chunk[len(chunk) // 2]) for chunk in bins if len(chunk) > 0]
+    return [int(round(x)) for x in np.linspace(0, total_count - 1, target_count)]
 
 
 def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[np.ndarray | None, np.ndarray | None]:
