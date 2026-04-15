@@ -204,6 +204,28 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_test1.py \
 
 Use `--analysis_scope full` to run the full backward/realtime splits instead of
 the smoke subset (8 samples per split).
+Use `--max_samples_per_subset 50` to randomly sample up to 50 examples from
+each OVO subset/task independently (for example `EPM`, `STU`, `OCR`) within the
+backward/realtime splits. When `--max_samples_per_subset` is set, it overrides
+the default smoke split cap.
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_frame_saliency_subset50_$(date +%Y%m%d_%H%M%S) \
+    --analysis_scope full \
+    --max_samples_per_subset 20 \
+    --recent_frames_only 4 \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --max_analysis_frames 12 \
+    --similarity_backends siglip \
+    --attention_modes first_token,question_prefill \
+    --attn_implementation eager \
+    > ./main_experiments/results/nohup_qwen3vl_saliency_full_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
 </details>
 
 ## 📢 Citation

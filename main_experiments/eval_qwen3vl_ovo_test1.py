@@ -10,6 +10,7 @@ on the backward and realtime OVO-Bench splits using:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import random
@@ -42,6 +43,53 @@ def smoke_cap_or_default(scope: str, max_samples_per_split: int | None) -> int |
     if max_samples_per_split is not None:
         return max_samples_per_split
     return 8 if scope == "smoke" else None
+
+
+def select_split_annotations(
+    annotations: list[dict[str, Any]],
+    allowed_tasks: list[str],
+    rng: random.Random,
+    max_samples_per_split: int | None = None,
+    max_samples_per_subset: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int]]:
+    grouped: dict[str, list[dict[str, Any]]] = {task: [] for task in allowed_tasks}
+    for anno in annotations:
+        task = str(anno.get("task", ""))
+        if task in grouped:
+            grouped[task].append(anno)
+
+    available_counts = {task: len(grouped[task]) for task in allowed_tasks}
+
+    if max_samples_per_subset is not None:
+        selected: list[dict[str, Any]] = []
+        selected_counts: dict[str, int] = {}
+        for task in allowed_tasks:
+            task_annos = list(grouped[task])
+            rng.shuffle(task_annos)
+            chosen = task_annos[:max_samples_per_subset]
+            selected_counts[task] = len(chosen)
+            selected.extend(chosen)
+        rng.shuffle(selected)
+        return selected, available_counts, selected_counts
+
+    pooled = [anno for task in allowed_tasks for anno in grouped[task]]
+    rng.shuffle(pooled)
+    if max_samples_per_split is not None:
+        pooled = pooled[:max_samples_per_split]
+    selected_counter = Counter(str(anno.get("task", "")) for anno in pooled)
+    selected_counts = {task: int(selected_counter.get(task, 0)) for task in allowed_tasks}
+    return pooled, available_counts, selected_counts
+
+
+def format_task_counts(
+    allowed_tasks: list[str],
+    selected_counts: dict[str, int],
+    available_counts: dict[str, int],
+) -> str:
+    return ", ".join(
+        f"{task}={selected_counts.get(task, 0)}/{available_counts.get(task, 0)}"
+        for task in allowed_tasks
+    )
 
 
 def append_record(handle: Any, record: dict[str, Any]) -> None:
@@ -108,6 +156,7 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
+    parser.add_argument("--max_samples_per_subset", type=int, default=None)
     parser.add_argument("--similarity_backends", default="siglip")
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
     parser.add_argument("--attention_modes", default="first_token,question_prefill")
@@ -132,21 +181,35 @@ def main() -> None:
         raise ValueError(f"Unsupported attention modes: {unsupported_attention}")
     if not similarity_backends and not attention_modes:
         raise ValueError("At least one similarity backend or attention mode must be enabled.")
+    if args.max_samples_per_split is not None and args.max_samples_per_split < 1:
+        raise ValueError("--max_samples_per_split must be >= 1 when provided.")
+    if args.max_samples_per_subset is not None and args.max_samples_per_subset < 1:
+        raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
+    if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
+        raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
 
-    sample_cap = smoke_cap_or_default(args.analysis_scope, args.max_samples_per_split)
+    split_sample_cap = (
+        None if args.max_samples_per_subset is not None else smoke_cap_or_default(args.analysis_scope, args.max_samples_per_split)
+    )
 
     with open(args.anno_path, encoding="utf-8") as handle:
         annotations = json.load(handle)
 
-    backward_anno = [anno for anno in annotations if anno["task"] in BACKWARD_TASKS]
-    realtime_anno = [anno for anno in annotations if anno["task"] in REAL_TIME_TASKS]
-
-    random.seed(args.seed)
-    random.shuffle(backward_anno)
-    random.shuffle(realtime_anno)
-    if sample_cap is not None:
-        backward_anno = backward_anno[:sample_cap]
-        realtime_anno = realtime_anno[:sample_cap]
+    rng = random.Random(args.seed)
+    backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
+        annotations,
+        BACKWARD_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
+    realtime_anno, realtime_available_counts, realtime_selected_counts = select_split_annotations(
+        annotations,
+        REAL_TIME_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
 
     result_dir = Path(args.result_dir)
     records_path = result_dir / "records.jsonl"
@@ -166,6 +229,14 @@ def main() -> None:
     print(f"Similarity: {similarity_backends or 'disabled'}")
     print(f"Attention: {attention_modes or 'disabled'}")
     print(f"Scope: {args.analysis_scope}")
+    if args.max_samples_per_subset is not None:
+        print(f"Sampling: up to {args.max_samples_per_subset} per subset/task")
+    elif split_sample_cap is not None:
+        print(f"Sampling: up to {split_sample_cap} per split")
+    else:
+        print("Sampling: full split")
+    print(f"Backward subsets: {format_task_counts(BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
+    print(f"Realtime subsets: {format_task_counts(REAL_TIME_TASKS, realtime_selected_counts, realtime_available_counts)}")
     print(f"Result Dir: {result_dir}")
     print("=" * 60 + "\n")
 
@@ -259,7 +330,8 @@ def main() -> None:
         "chunk_duration": args.chunk_duration,
         "fps": args.fps,
         "analysis_scope": args.analysis_scope,
-        "max_samples_per_split": sample_cap,
+        "max_samples_per_split": split_sample_cap,
+        "max_samples_per_subset": args.max_samples_per_subset,
         "similarity_backends": similarity_backends,
         "siglip_model_name": args.siglip_model_name,
         "attention_modes": attention_modes,
