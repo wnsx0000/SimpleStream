@@ -59,6 +59,44 @@ def maybe_generate_plots(result_dir: str) -> str | None:
         return str(exc)
 
 
+def format_mean_std(mean_value: Any, std_value: Any) -> str:
+    if mean_value is None:
+        return "n/a"
+    mean = float(mean_value)
+    if std_value is None:
+        return f"{mean:.4f}"
+    return f"{mean:.4f} +/- {float(std_value):.4f}"
+
+
+def print_metric_summary(summary: dict[str, Any]) -> None:
+    metric_labels = {
+        "siglip_similarity": "SigLIP similarity",
+        "question_prefill_attention": "Question prefill attention",
+        "first_token_attention": "First token attention",
+    }
+    metrics = summary.get("metrics", {})
+    if not metrics:
+        return
+
+    print("Aggregate metrics (pooled):")
+    for metric_name, label in metric_labels.items():
+        stats = metrics.get(metric_name)
+        if not stats:
+            continue
+        mean_percentile = format_mean_std(
+            stats.get("recent4_mean_percentile_mean"),
+            stats.get("recent4_mean_percentile_std"),
+        )
+        overlap = format_mean_std(
+            stats.get("recent4_top4_overlap_mean"),
+            stats.get("recent4_top4_overlap_std"),
+        )
+        print(
+            f"  {label}: recent4_mean_percentile={mean_percentile}, "
+            f"recent4_top4_overlap={overlap} (n={stats.get('count', 0)})"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OVO-Bench backward/realtime recent4 saliency analysis for Qwen3-VL")
     parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
@@ -238,6 +276,7 @@ def main() -> None:
     save_json(result_dir / "summary.json", summary)
 
     print("\n" + "=" * 60)
+    print_metric_summary(summary)
     print(f"Records saved to: {records_path}")
     print(f"Summary saved to: {result_dir / 'summary.json'}")
     if plot_error:

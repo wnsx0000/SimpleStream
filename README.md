@@ -177,7 +177,8 @@ The top-level fields in `summary.json` remain pooled across the analyzed records
 while split-specific summaries are stored under `summary["splits"]["backward"]`
 and `summary["splits"]["realtime"]`. Each split section also includes
 `task_mean_metrics`, which averages the task subset summaries within that split
-with equal task weight. Aggregate plots are written both to the
+with equal task weight. Metric summaries now include both `*_mean` and `*_std`
+fields. Aggregate plots are written both to the
 pooled `plots/` directory and to split-specific directories under
 `plots/backward/` and `plots/realtime/`.
 If the sampled window is longer than `--max_analysis_frames`, attention is

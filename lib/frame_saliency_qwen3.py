@@ -664,6 +664,15 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
         "tasks": {},
     }
 
+    def summarize_stats(values: list[float], prefix: str) -> dict[str, float]:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.size < 1:
+            return {}
+        return {
+            f"{prefix}_mean": float(arr.mean()),
+            f"{prefix}_std": float(arr.std()),
+        }
+
     def summarize_metrics(metric_records: list[dict[str, Any]]) -> dict[str, Any]:
         metrics_summary: dict[str, Any] = {}
 
@@ -672,11 +681,13 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
             if values:
                 metrics_summary[name] = {
                     "count": len(values),
-                    "recent4_mean_percentile_mean": float(
-                        np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_mean_percentile"] for item in values],
+                        "recent4_mean_percentile",
                     ),
-                    "recent4_top4_overlap_mean": float(
-                        np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_top4_overlap"] for item in values],
+                        "recent4_top4_overlap",
                     ),
                 }
 
@@ -703,17 +714,23 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
 
                 summary_payload = {
                     "count": len(values),
-                    "recent4_mean_percentile_mean": float(
-                        np.mean([item["recent4_mean_percentile"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_mean_percentile"] for item in values],
+                        "recent4_mean_percentile",
                     ),
-                    "recent4_top4_overlap_mean": float(
-                        np.mean([item["recent4_top4_overlap"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_top4_overlap"] for item in values],
+                        "recent4_top4_overlap",
                     ),
                 }
                 if layer_recent_rows and layer_overlap_rows:
+                    stacked_recent = np.vstack(layer_recent_rows).astype(np.float64, copy=False)
+                    stacked_overlap = np.vstack(layer_overlap_rows).astype(np.float64, copy=False)
                     summary_payload["display_layer_indices"] = display_layer_indices
-                    summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
+                    summary_payload["layer_recent4_mean_percentile_mean"] = stacked_recent.mean(axis=0).tolist()
+                    summary_payload["layer_recent4_mean_percentile_std"] = stacked_recent.std(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_mean"] = stacked_overlap.mean(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_std"] = stacked_overlap.std(axis=0).tolist()
                 if num_layers_total is not None:
                     summary_payload["num_layers_total"] = num_layers_total
                 metrics_summary[name] = summary_payload
@@ -732,11 +749,13 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
             if values:
                 task_mean_metrics[name] = {
                     "task_count": len(values),
-                    "recent4_mean_percentile_mean": float(
-                        np.mean([item["recent4_mean_percentile_mean"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_mean_percentile_mean"] for item in values],
+                        "recent4_mean_percentile",
                     ),
-                    "recent4_top4_overlap_mean": float(
-                        np.mean([item["recent4_top4_overlap_mean"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_top4_overlap_mean"] for item in values],
+                        "recent4_top4_overlap",
                     ),
                 }
 
@@ -767,17 +786,23 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
 
                 summary_payload = {
                     "task_count": len(values),
-                    "recent4_mean_percentile_mean": float(
-                        np.mean([item["recent4_mean_percentile_mean"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_mean_percentile_mean"] for item in values],
+                        "recent4_mean_percentile",
                     ),
-                    "recent4_top4_overlap_mean": float(
-                        np.mean([item["recent4_top4_overlap_mean"] for item in values], dtype=np.float64)
+                    **summarize_stats(
+                        [item["recent4_top4_overlap_mean"] for item in values],
+                        "recent4_top4_overlap",
                     ),
                 }
                 if layer_recent_rows and layer_overlap_rows:
+                    stacked_recent = np.vstack(layer_recent_rows).astype(np.float64, copy=False)
+                    stacked_overlap = np.vstack(layer_overlap_rows).astype(np.float64, copy=False)
                     summary_payload["display_layer_indices"] = display_layer_indices
-                    summary_payload["layer_recent4_mean_percentile_mean"] = np.vstack(layer_recent_rows).mean(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_mean"] = np.vstack(layer_overlap_rows).mean(axis=0).tolist()
+                    summary_payload["layer_recent4_mean_percentile_mean"] = stacked_recent.mean(axis=0).tolist()
+                    summary_payload["layer_recent4_mean_percentile_std"] = stacked_recent.std(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_mean"] = stacked_overlap.mean(axis=0).tolist()
+                    summary_payload["layer_recent4_top4_overlap_std"] = stacked_overlap.std(axis=0).tolist()
                 if num_layers_total is not None:
                     summary_payload["num_layers_total"] = num_layers_total
                 task_mean_metrics[name] = summary_payload
