@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from lib.recent_window_eval import decode_video_to_chunks_qwen, evenly_spaced_indices, select_attention_frame_indices
+from lib.recent_window_eval import decode_video_to_chunks_qwen, select_attention_frame_indices
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
 DISPLAY_LAYER_COUNT = 10
@@ -334,6 +335,136 @@ class SiglipFrameEncoder:
         return text_feature
 
 
+def resolve_siglip_device(fallback_device: str | torch.device | None = None) -> torch.device:
+    if torch.cuda.device_count() > 1:
+        return torch.device(f"cuda:{torch.cuda.device_count() - 1}")
+    if fallback_device is not None:
+        return torch.device(fallback_device)
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def build_analysis_subset(
+    total_frames: int,
+    recent_indices: list[int],
+    max_analysis_frames: int,
+) -> tuple[list[int], list[int], str]:
+    analysis_frame_indices, analysis_sampling_strategy = select_attention_frame_indices(
+        total_frames=total_frames,
+        recent_indices=recent_indices,
+        max_analysis_frames=max_analysis_frames,
+    )
+    analysis_index_lookup = {frame_idx: local_idx for local_idx, frame_idx in enumerate(analysis_frame_indices)}
+    analysis_recent_indices = [
+        analysis_index_lookup[frame_idx]
+        for frame_idx in recent_indices
+        if frame_idx in analysis_index_lookup
+    ]
+    return analysis_frame_indices, analysis_recent_indices, analysis_sampling_strategy
+
+
+class SiglipOnlyRecent4FrameSaliencyAnalyzer:
+    def __init__(
+        self,
+        siglip_model_name: str = "google/siglip-so400m-patch14-384",
+        device: str | torch.device = "auto",
+    ) -> None:
+        self.siglip_model_name = siglip_model_name
+        self.device = device
+        self._siglip_encoder: SiglipFrameEncoder | None = None
+
+    def get_siglip_encoder(self) -> SiglipFrameEncoder:
+        if self._siglip_encoder is None:
+            fallback_device = None if str(self.device) == "auto" else self.device
+            self._siglip_encoder = SiglipFrameEncoder(
+                self.siglip_model_name,
+                resolve_siglip_device(fallback_device=fallback_device),
+            )
+        return self._siglip_encoder
+
+    @torch.inference_mode()
+    def analyze_sample(
+        self,
+        video_path: str,
+        prompt: str,
+        similarity_text: str | None,
+        chunk_duration: float,
+        fps: float,
+        recent_frames_only: int,
+        similarity_backends: list[str],
+        attention_modes: list[str],
+        max_analysis_frames: int,
+        save_example_matrices: bool = False,
+        save_raw_attentions: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        del prompt
+        if attention_modes:
+            raise ValueError("SigLIP-only analyzer does not support attention modes.")
+
+        chunks, decode_backend = decode_video_to_chunks_qwen(
+            video_path=video_path,
+            chunk_duration=chunk_duration,
+            fps=fps,
+            recent_frames_only=recent_frames_only,
+        )
+        if not chunks:
+            raise ValueError(f"No chunks decoded from video: {video_path}")
+
+        frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
+        num_sampled_frames = len(frames)
+        del chunks
+
+        metrics: dict[str, Any] = {}
+        example_payload: dict[str, Any] = {
+            "video_path": video_path,
+            "decode_backend": decode_backend,
+            "frame_rows": frame_rows,
+            "recent_frame_indices": recent_indices,
+            "recent_chunk_ids": recent_chunk_ids,
+        } if (save_example_matrices or save_raw_attentions) else {}
+
+        analysis_frame_indices, analysis_recent_indices, analysis_sampling_strategy = build_analysis_subset(
+            total_frames=num_sampled_frames,
+            recent_indices=recent_indices,
+            max_analysis_frames=max_analysis_frames,
+        )
+
+        if "siglip" in similarity_backends:
+            siglip_encoder = self.get_siglip_encoder()
+            analysis_frames = [frames[frame_idx] for frame_idx in analysis_frame_indices]
+            siglip_features = siglip_encoder.encode_frames(analysis_frames)
+            del analysis_frames
+            siglip_question_feature = siglip_encoder.encode_text(similarity_text or "")
+            siglip_scores = cosine_scores_against_query(siglip_features, siglip_question_feature).tolist()
+            metrics["siglip_similarity"] = summarize_scalar_metric(siglip_scores, analysis_recent_indices)
+            metrics["siglip_similarity"]["analysis_frame_indices"] = analysis_frame_indices
+            metrics["siglip_similarity"]["recent_frame_indices_within_analysis"] = analysis_recent_indices
+            metrics["siglip_similarity"]["analysis_sampling_strategy"] = analysis_sampling_strategy
+            if save_example_matrices:
+                example_payload["siglip_similarity_query"] = str(similarity_text or "")
+            del siglip_features, siglip_question_feature, siglip_scores
+
+        del frames
+
+        record = {
+            "video_path": video_path,
+            "decode_backend": decode_backend,
+            "num_sampled_frames": num_sampled_frames,
+            "recent_chunk_ids": recent_chunk_ids,
+            "recent_frame_indices": recent_indices,
+            "attention_frame_indices": list(range(num_sampled_frames)),
+            "attention_sampling_strategy": "all_frames",
+            "frames": frame_rows,
+            "metrics": metrics,
+            "attention_skipped_reason": None,
+        }
+
+        if save_example_matrices or save_raw_attentions:
+            example_payload["metrics"] = metrics
+        return record, (example_payload if save_example_matrices or save_raw_attentions else None)
+
+
 class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
     def __init__(
         self,
@@ -354,10 +485,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
 
     def get_siglip_encoder(self) -> SiglipFrameEncoder:
         if self._siglip_encoder is None:
-            if torch.cuda.device_count() > 1:
-                siglip_device = torch.device(f"cuda:{torch.cuda.device_count() - 1}")
-            else:
-                siglip_device = self._get_visual_device()
+            siglip_device = resolve_siglip_device(fallback_device=self._get_visual_device())
             self._siglip_encoder = SiglipFrameEncoder(self.siglip_model_name, siglip_device)
         return self._siglip_encoder
 
@@ -512,17 +640,12 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
 
         # Compute one shared analysis subset so SigLIP and attention use the same
         # frame selection policy when max_analysis_frames is active.
-        analysis_frame_indices, analysis_sampling_strategy = select_attention_frame_indices(
+        analysis_frame_indices, analysis_recent_indices, analysis_sampling_strategy = build_analysis_subset(
             total_frames=num_sampled_frames,
             recent_indices=recent_indices,
             max_analysis_frames=max_analysis_frames,
         )
         analysis_index_lookup = {frame_idx: local_idx for local_idx, frame_idx in enumerate(analysis_frame_indices)}
-        analysis_recent_indices = [
-            analysis_index_lookup[frame_idx]
-            for frame_idx in recent_indices
-            if frame_idx in analysis_index_lookup
-        ]
 
         # If requested, compute SigLIP frame-text similarity and summarize it over recent frames.
         if "siglip" in similarity_backends:
@@ -671,6 +794,58 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         if save_example_matrices or save_raw_attentions:
             example_payload["metrics"] = metrics
         return record, (example_payload if save_example_matrices or save_raw_attentions else None)
+
+
+def build_siglip_frame_saliency_analyzer(
+    siglip_model_name: str = "google/siglip-so400m-patch14-384",
+    device: str | torch.device = "auto",
+) -> SiglipOnlyRecent4FrameSaliencyAnalyzer:
+    return SiglipOnlyRecent4FrameSaliencyAnalyzer(
+        siglip_model_name=siglip_model_name,
+        device=device,
+    )
+
+
+def build_qwen3_attention_frame_saliency_analyzer(
+    model_name: str,
+    device: str | torch.device = "auto",
+    max_new_tokens: int = 256,
+    attn_implementation: str = "eager",
+) -> Qwen3Recent4FrameSaliencyAnalyzer:
+    return Qwen3Recent4FrameSaliencyAnalyzer(
+        model_name=model_name,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        attn_implementation=attn_implementation,
+    )
+
+
+def build_frame_saliency_analyzer(
+    model_name: str,
+    device: str | torch.device = "auto",
+    max_new_tokens: int = 256,
+    attn_implementation: str = "eager",
+    siglip_model_name: str = "google/siglip-so400m-patch14-384",
+    attention_modes: list[str] | None = None,
+) -> SiglipOnlyRecent4FrameSaliencyAnalyzer | Qwen3Recent4FrameSaliencyAnalyzer:
+    warnings.warn(
+        "build_frame_saliency_analyzer() is deprecated. "
+        "Use build_siglip_frame_saliency_analyzer() or "
+        "build_qwen3_attention_frame_saliency_analyzer() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if attention_modes:
+        return build_qwen3_attention_frame_saliency_analyzer(
+            model_name=model_name,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            attn_implementation=attn_implementation,
+        )
+    return build_siglip_frame_saliency_analyzer(
+        siglip_model_name=siglip_model_name,
+        device=device,
+    )
 
 
 def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metrics: bool = False) -> dict[str, Any]:

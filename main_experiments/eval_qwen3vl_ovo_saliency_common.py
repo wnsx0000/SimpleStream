@@ -1,21 +1,11 @@
-"""
-OVO-Bench recent4 saliency analysis for Qwen3-VL.
-
-Compares the frames selected by SimpleStream's recent4 policy
-on the backward and realtime OVO-Bench splits using:
-- SigLIP-SO400M frame-question cosine similarity
-- Qwen3 text self-attention aggregated layer-wise
-"""
-
 from __future__ import annotations
 
-import argparse
 import gc
-from collections import Counter
 import json
 import os
 import random
-import sys
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,17 +13,52 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from lib.frame_saliency_qwen3 import build_experiment_summary, save_json, slugify
+from lib.recent_window_eval import build_ovo_prompt, load_jsonl_results
+from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 
-from lib.frame_saliency_qwen3 import (  # noqa: E402
-    Qwen3Recent4FrameSaliencyAnalyzer,
-    build_experiment_summary,
-    parse_csv_options,
-    save_json,
-    slugify,
-)
-from lib.recent_window_eval import build_ovo_prompt, load_jsonl_results  # noqa: E402
-from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS  # noqa: E402
+
+@dataclass
+class SaliencyExperimentConfig:
+    run_label: str
+    anno_path: str
+    chunked_dir: str
+    result_dir: str
+    recent_frames_only: int = 4
+    chunk_duration: float = 1.0
+    fps: float = 1.0
+    analysis_scope: str = "full"
+    max_samples_per_split: int | None = None
+    max_samples_per_subset: int | None = None
+    similarity_backends: list[str] = field(default_factory=list)
+    attention_modes: list[str] = field(default_factory=list)
+    save_example_matrices: int = 8
+    save_raw_attn_examples: int = 0
+    max_analysis_frames: int = 40
+    seed: int = 42
+    extra_summary_config: dict[str, Any] = field(default_factory=dict)
+
+
+def add_common_saliency_args(
+    parser: Any,
+    *,
+    default_result_dir: str,
+    include_save_raw_attn_examples: bool,
+) -> None:
+    parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
+    parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
+    parser.add_argument("--result_dir", default=default_result_dir)
+    parser.add_argument("--recent_frames_only", type=int, default=4)
+    parser.add_argument("--chunk_duration", type=float, default=1.0)
+    parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
+    parser.add_argument("--max_samples_per_split", type=int, default=None)
+    parser.add_argument("--max_samples_per_subset", type=int, default=None)
+    parser.add_argument("--save_example_matrices", type=int, default=8)
+    if include_save_raw_attn_examples:
+        parser.add_argument("--save_raw_attn_examples", type=int, default=0)
+    parser.add_argument("--max_analysis_frames", type=int, default=40)
+    parser.add_argument("--seed", type=int, default=42)
 
 
 def make_key(task: str, sample_id: Any) -> str:
@@ -146,73 +171,45 @@ def print_metric_summary(summary: dict[str, Any]) -> None:
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="OVO-Bench backward/realtime recent4 saliency analysis for Qwen3-VL")
-    parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
-    parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
-    parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
-    parser.add_argument("--result_dir", default="results/ovo_saliency_qwen3vl")
-    parser.add_argument("--recent_frames_only", type=int, default=4)
-    parser.add_argument("--chunk_duration", type=float, default=1.0)
-    parser.add_argument("--fps", type=float, default=1.0)
-    parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
-    parser.add_argument("--max_samples_per_split", type=int, default=None)
-    parser.add_argument("--max_samples_per_subset", type=int, default=None)
-    parser.add_argument("--similarity_backends", default="siglip")
-    parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
-    parser.add_argument("--attention_modes", default="first_token,question_prefill")
-
-    parser.add_argument("--attn_implementation", default="eager")
-    parser.add_argument("--save_example_matrices", type=int, default=8)
-    parser.add_argument("--save_raw_attn_examples", type=int, default=0)
-    parser.add_argument("--max_analysis_frames", type=int, default=40)
-    parser.add_argument("--max_new_tokens", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    similarity_backends = parse_csv_options(args.similarity_backends)
-    attention_modes = parse_csv_options(args.attention_modes)
-    supported_similarity = {"siglip"}
-    supported_attention = {"first_token", "question_prefill"}
-    unsupported_similarity = sorted(set(similarity_backends) - supported_similarity)
-    unsupported_attention = sorted(set(attention_modes) - supported_attention)
-    if unsupported_similarity:
-        raise ValueError(f"Unsupported similarity backends: {unsupported_similarity}")
-    if unsupported_attention:
-        raise ValueError(f"Unsupported attention modes: {unsupported_attention}")
-    if not similarity_backends and not attention_modes:
-        raise ValueError("At least one similarity backend or attention mode must be enabled.")
-    if args.max_samples_per_split is not None and args.max_samples_per_split < 1:
+def run_saliency_experiment(
+    analyzer: Any,
+    config: SaliencyExperimentConfig,
+) -> dict[str, Any]:
+    if config.max_samples_per_split is not None and config.max_samples_per_split < 1:
         raise ValueError("--max_samples_per_split must be >= 1 when provided.")
-    if args.max_samples_per_subset is not None and args.max_samples_per_subset < 1:
+    if config.max_samples_per_subset is not None and config.max_samples_per_subset < 1:
         raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
-    if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
+    if config.max_samples_per_split is not None and config.max_samples_per_subset is not None:
         raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
+    if not config.similarity_backends and not config.attention_modes:
+        raise ValueError("At least one similarity backend or attention mode must be enabled.")
 
     split_sample_cap = (
-        None if args.max_samples_per_subset is not None else smoke_cap_or_default(args.analysis_scope, args.max_samples_per_split)
+        None
+        if config.max_samples_per_subset is not None
+        else smoke_cap_or_default(config.analysis_scope, config.max_samples_per_split)
     )
 
-    with open(args.anno_path, encoding="utf-8") as handle:
+    with open(config.anno_path, encoding="utf-8") as handle:
         annotations = json.load(handle)
 
-    rng = random.Random(args.seed)
+    rng = random.Random(config.seed)
     backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
         annotations,
         BACKWARD_TASKS,
         rng,
         max_samples_per_split=split_sample_cap,
-        max_samples_per_subset=args.max_samples_per_subset,
+        max_samples_per_subset=config.max_samples_per_subset,
     )
     realtime_anno, realtime_available_counts, realtime_selected_counts = select_split_annotations(
         annotations,
         REAL_TIME_TASKS,
         rng,
         max_samples_per_split=split_sample_cap,
-        max_samples_per_subset=args.max_samples_per_subset,
+        max_samples_per_subset=config.max_samples_per_subset,
     )
 
-    result_dir = Path(args.result_dir)
+    result_dir = Path(config.result_dir)
     records_path = result_dir / "records.jsonl"
     examples_dir = result_dir / "examples"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -223,15 +220,15 @@ def main() -> None:
     saved_raw = sum(1 for record in existing_records if record.get("raw_attention_saved"))
 
     print("\n" + "=" * 60)
-    print("OVO-Bench Recent4 Saliency Analysis (Qwen3-VL)")
+    print(config.run_label)
     print("=" * 60)
     print(f"Backward: {len(backward_anno)}")
     print(f"Realtime: {len(realtime_anno)}")
-    print(f"Similarity: {similarity_backends or 'disabled'}")
-    print(f"Attention: {attention_modes or 'disabled'}")
-    print(f"Scope: {args.analysis_scope}")
-    if args.max_samples_per_subset is not None:
-        print(f"Sampling: up to {args.max_samples_per_subset} per subset/task")
+    print(f"Similarity: {config.similarity_backends or 'disabled'}")
+    print(f"Attention: {config.attention_modes or 'disabled'}")
+    print(f"Scope: {config.analysis_scope}")
+    if config.max_samples_per_subset is not None:
+        print(f"Sampling: up to {config.max_samples_per_subset} per subset/task")
     elif split_sample_cap is not None:
         print(f"Sampling: up to {split_sample_cap} per split")
     else:
@@ -241,41 +238,30 @@ def main() -> None:
     print(f"Result Dir: {result_dir}")
     print("=" * 60 + "\n")
 
-    analyzer = Qwen3Recent4FrameSaliencyAnalyzer(
-        model_name=args.model_path,
-        device="auto",
-        max_new_tokens=args.max_new_tokens,
-        attn_implementation=args.attn_implementation,
-        siglip_model_name=args.siglip_model_name,
-    )
-
     all_records = list(existing_records)
 
     with records_path.open("a", encoding="utf-8") as handle:
-        for split_name, split_annos in (
-            ("backward", backward_anno),
-            ("realtime", realtime_anno),
-        ):
+        for split_name, split_annos in (("backward", backward_anno), ("realtime", realtime_anno)):
             for anno in tqdm(split_annos, desc=split_name.capitalize()):
                 key = make_key(anno["task"], anno["id"])
                 if key in done_keys:
                     continue
 
-                video_path = os.path.join(args.chunked_dir, f"{anno['id']}.mp4")
-                save_example = saved_examples < int(args.save_example_matrices)
-                save_raw = saved_raw < int(args.save_raw_attn_examples)
+                video_path = os.path.join(config.chunked_dir, f"{anno['id']}.mp4")
+                save_example = saved_examples < int(config.save_example_matrices)
+                save_raw = bool(config.attention_modes) and saved_raw < int(config.save_raw_attn_examples)
 
                 try:
                     record, example_payload = analyzer.analyze_sample(
                         video_path=video_path,
                         prompt=build_ovo_prompt(anno["task"], anno),
                         similarity_text=str(anno.get("question", "")).strip(),
-                        chunk_duration=args.chunk_duration,
-                        fps=args.fps,
-                        recent_frames_only=args.recent_frames_only,
-                        similarity_backends=similarity_backends,
-                        attention_modes=attention_modes,
-                        max_analysis_frames=args.max_analysis_frames,
+                        chunk_duration=config.chunk_duration,
+                        fps=config.fps,
+                        recent_frames_only=config.recent_frames_only,
+                        similarity_backends=config.similarity_backends,
+                        attention_modes=config.attention_modes,
+                        max_analysis_frames=config.max_analysis_frames,
                         save_example_matrices=save_example,
                         save_raw_attentions=save_raw,
                     )
@@ -317,7 +303,6 @@ def main() -> None:
                         "video_path": video_path,
                         "error": str(exc),
                     }
-                    # Ensure GPU memory is freed after OOM or other errors
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -326,27 +311,27 @@ def main() -> None:
                 all_records.append(output)
                 done_keys.add(key)
 
-    config = {
+    summary_config = {
         "generated_at": datetime.now().isoformat(),
-        "model_path": args.model_path,
-        "anno_path": args.anno_path,
-        "chunked_dir": args.chunked_dir,
-        "recent_frames_only": args.recent_frames_only,
-        "chunk_duration": args.chunk_duration,
-        "fps": args.fps,
-        "analysis_scope": args.analysis_scope,
+        "anno_path": config.anno_path,
+        "chunked_dir": config.chunked_dir,
+        "result_dir": config.result_dir,
+        "recent_frames_only": config.recent_frames_only,
+        "chunk_duration": config.chunk_duration,
+        "fps": config.fps,
+        "analysis_scope": config.analysis_scope,
         "max_samples_per_split": split_sample_cap,
-        "max_samples_per_subset": args.max_samples_per_subset,
-        "similarity_backends": similarity_backends,
-        "siglip_model_name": args.siglip_model_name,
-        "attention_modes": attention_modes,
-        "attn_implementation": args.attn_implementation,
-        "save_example_matrices": args.save_example_matrices,
-        "save_raw_attn_examples": args.save_raw_attn_examples,
-        "max_analysis_frames": args.max_analysis_frames,
-        "seed": args.seed,
+        "max_samples_per_subset": config.max_samples_per_subset,
+        "similarity_backends": list(config.similarity_backends),
+        "attention_modes": list(config.attention_modes),
+        "save_example_matrices": config.save_example_matrices,
+        "save_raw_attn_examples": config.save_raw_attn_examples,
+        "max_analysis_frames": config.max_analysis_frames,
+        "seed": config.seed,
     }
-    summary = build_experiment_summary(all_records, config=config)
+    summary_config.update(config.extra_summary_config)
+
+    summary = build_experiment_summary(all_records, config=summary_config)
     plot_error = maybe_generate_plots(str(result_dir))
     if plot_error:
         summary["plot_generation_error"] = plot_error
@@ -362,6 +347,4 @@ def main() -> None:
         print(f"Plots saved to: {result_dir / 'plots'}")
     print("=" * 60 + "\n")
 
-
-if __name__ == "__main__":
-    main()
+    return summary
