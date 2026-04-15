@@ -164,7 +164,7 @@ python scoring/score_ovo_bench.py \
 ## Additional Experiments
 
 <details>
-<summary><b>Saliency Test</b></summary>
+<summary><b>Test 1</b></summary>
 
 Measures whether the `recent4` frames selected by SimpleStream are also salient 
 among all sampled frames in the same window for the OVO-Bench backward and
@@ -265,6 +265,62 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_
     --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
     > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+</details>
+
+<details>
+<summary><b>Test 2</b></summary>
+
+Runs OVO-Bench backward/realtime evaluation with SigLIP-guided frame selection.
+For each sample, the script first builds a candidate frame pool from the full
+decoded video (up to `--max_analysis_frames` frames using the same
+`uniform_with_recent_anchor` policy as Test 1), computes cosine similarity
+between each candidate frame and the question, selects the top-4 frames, then
+reorders those four frames temporally before Qwen3-VL inference.
+
+Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
+`qwen3vl_siglip_top4_results_*.json`. `summary.json` reports subset/task
+accuracy, split-level official averages and pooled accuracy, plus both
+`Official Total Avg.` and `Pooled Overall Acc.` for the full run.
+
+siglip top-4 smoke test.
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_smoke_$(date +%Y%m%d_%H%M%S) \
+    --analysis_scope smoke \
+    --recent_frames_only 4 \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --max_analysis_frames 12 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_smoke_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+Use `--analysis_scope full` to evaluate the full backward/realtime splits.
+Use `--max_samples_per_subset 50` to sample up to 50 examples independently
+from each OVO subset/task within those splits. `--max_frames` is kept as an
+alias of `--max_analysis_frames` for backward compatibility.
+
+siglip top-4 subset20 test.
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_subset20_$(date +%Y%m%d_%H%M%S) \
+    --analysis_scope full \
+    --max_samples_per_subset 20 \
+    --recent_frames_only 4 \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --max_analysis_frames 12 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 </details>
 

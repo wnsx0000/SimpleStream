@@ -1,15 +1,15 @@
 """
-OVO-Bench full-frame evaluation for Qwen3-VL.
+OVO-Bench SigLIP top-4 frame evaluation for Qwen3-VL.
 
-Unlike eval_qwen3vl_ovo.py which uses only the last N recent chunks,
-this script uses ALL available frames (up to --max_frames), uniformly
-sampling non-recent frames when the total exceeds the cap while always
-including recent frames.
+This script scores a candidate frame subset with SigLIP cosine similarity
+against the question, keeps the top-4 frames, reorders them temporally,
+and runs QA using Qwen3-VL.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -17,6 +17,8 @@ import sys
 import time
 from datetime import datetime
 from typing import Any
+
+import torch
 
 os.environ.setdefault("NCCL_TIMEOUT", "7200")
 os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
@@ -27,19 +29,40 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
-from lib.recent_window_eval import load_jsonl_results
-from lib.recent_window_eval_qwen3 import (
-    RecentWindowQAModel,
-    evaluate_ovo_backward_realtime,
-    print_ovo_results,
+from lib.frame_saliency_qwen3 import (
+    SiglipFrameEncoder,
+    build_analysis_subset,
+    cosine_scores_against_query,
+    flatten_chunks,
+)
+from lib.recent_window_eval import (
+    build_ovo_prompt,
+    decode_video_to_chunks_qwen,
+    load_jsonl_results,
+    score_ovo_br,
+)
+from lib.recent_window_eval_qwen3 import RecentWindowQAModel
+from main_experiments.eval_qwen3vl_ovo_saliency_common import (
+    format_task_counts,
+    select_split_annotations,
+    smoke_cap_or_default,
 )
 
-MODEL_LABEL = "Qwen3-VL-FullFrame"
+MODEL_LABEL = "Qwen3-VL-SigLIP-Top4"
 EXCLUDED_FORWARD_TASKS = ("REC", "SSR", "CRR")
+TOP_K_FRAMES = 4
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
     return f"{item.get('task', '')}:{item.get('id')}"
+
+
+def infer_split_name(task: str) -> str:
+    if task in BACKWARD_TASKS:
+        return "backward"
+    if task in REAL_TIME_TASKS:
+        return "realtime"
+    return "unknown"
 
 
 def get_checkpoint_path(result_dir: str, process_index: int, num_processes: int) -> str:
@@ -76,10 +99,10 @@ def load_checkpoint_state(path: str) -> tuple[list[dict[str, Any]], list[dict[st
         if not isinstance(key, str) or not key:
             key = make_ovo_key(item)
         done_keys.add(key)
-        task = item.get("task")
-        if task in BACKWARD_TASKS:
+        split_name = str(item.get("split") or infer_split_name(str(item.get("task", ""))))
+        if split_name == "backward":
             backward_results.append(item)
-        elif task in REAL_TIME_TASKS:
+        elif split_name == "realtime":
             realtime_results.append(item)
 
     return backward_results, realtime_results, forward_results, done_keys
@@ -114,17 +137,17 @@ def merge_shard_results(result_dir: str, num_processes: int) -> tuple[list[dict[
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            task = item.get("task")
-            if task in BACKWARD_TASKS:
+            split_name = str(item.get("split") or infer_split_name(str(item.get("task", ""))))
+            if split_name == "backward":
                 backward_results.append(item)
-            elif task in REAL_TIME_TASKS:
+            elif split_name == "realtime":
                 realtime_results.append(item)
 
     return backward_results, realtime_results, forward_results
 
 
 def write_done_marker(path: str) -> None:
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         handle.write(datetime.now().isoformat() + "\n")
 
 
@@ -146,17 +169,302 @@ def wait_for_done_markers(result_dir: str, num_processes: int) -> None:
         time.sleep(poll_interval)
 
 
+def write_json(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def decode_full_video_to_chunks(
+    *,
+    video_path: str,
+    chunk_duration: float,
+    fps: float,
+) -> tuple[list[Any], str]:
+    saved_exact_recent = os.environ.pop("QWEN_EXACT_RECENT_DECODE", None)
+    try:
+        return decode_video_to_chunks_qwen(
+            video_path=video_path,
+            chunk_duration=chunk_duration,
+            fps=fps,
+            recent_frames_only=None,
+        )
+    finally:
+        if saved_exact_recent is not None:
+            os.environ["QWEN_EXACT_RECENT_DECODE"] = saved_exact_recent
+
+
+def score_record(record: dict[str, Any]) -> int:
+    if record.get("correct") is not None:
+        return int(record["correct"])
+    return int(score_ovo_br(record.get("response"), str(record.get("ground_truth", ""))))
+
+
+def build_eval_summary(
+    *,
+    backward_results: list[dict[str, Any]],
+    realtime_results: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    split_specs = (
+        ("backward", "Backward Tracing", BACKWARD_TASKS, backward_results),
+        ("realtime", "Real-time Perception", REAL_TIME_TASKS, realtime_results),
+    )
+
+    split_payloads: dict[str, Any] = {}
+    official_split_avgs: list[float] = []
+    total_correct = 0
+    total_count = 0
+
+    for split_name, split_title, task_order, records in split_specs:
+        subset_rows: list[dict[str, Any]] = []
+        subsets: dict[str, Any] = {}
+        split_correct = 0
+        split_total = 0
+
+        for task in task_order:
+            task_records = [record for record in records if str(record.get("task", "")) == task]
+            if not task_records:
+                continue
+
+            task_correct = sum(score_record(record) for record in task_records)
+            task_total = len(task_records)
+            task_accuracy = 100.0 * float(task_correct) / float(task_total)
+            row = {
+                "task": task,
+                "correct": task_correct,
+                "total": task_total,
+                "accuracy": task_accuracy,
+            }
+            subset_rows.append(row)
+            subsets[task] = row
+            split_correct += task_correct
+            split_total += task_total
+
+        official_split_avg = (
+            sum(row["accuracy"] for row in subset_rows) / len(subset_rows)
+            if subset_rows
+            else 0.0
+        )
+        pooled_accuracy = 100.0 * float(split_correct) / float(split_total) if split_total else 0.0
+        split_payloads[split_name] = {
+            "title": split_title,
+            "subset_accuracy_list": subset_rows,
+            "subsets": subsets,
+            "official_split_avg": official_split_avg,
+            "pooled_accuracy": pooled_accuracy,
+            "correct": split_correct,
+            "total": split_total,
+        }
+
+        if subset_rows:
+            official_split_avgs.append(official_split_avg)
+        total_correct += split_correct
+        total_count += split_total
+
+    official_total_avg = (
+        sum(official_split_avgs) / len(official_split_avgs)
+        if official_split_avgs
+        else 0.0
+    )
+    pooled_overall_accuracy = 100.0 * float(total_correct) / float(total_count) if total_count else 0.0
+
+    return {
+        "config": config,
+        "splits": split_payloads,
+        "overall": {
+            "official_total_avg": official_total_avg,
+            "pooled_overall_accuracy": pooled_overall_accuracy,
+            "correct": total_correct,
+            "total": total_count,
+        },
+    }
+
+
+def print_eval_summary(model_label: str, summary: dict[str, Any]) -> None:
+    print("\n" + "=" * 60)
+    print(f"OVO-Bench SigLIP Top-4 Results ({model_label})")
+    print("=" * 60)
+
+    for split_name in ("backward", "realtime"):
+        split_summary = summary.get("splits", {}).get(split_name, {})
+        subset_rows = split_summary.get("subset_accuracy_list", [])
+        if not subset_rows:
+            continue
+
+        print(f"\n{split_summary.get('title', split_name.title())}:")
+        for row in subset_rows:
+            print(f"  {row['task']}: {row['accuracy']:.2f}% ({row['correct']}/{row['total']})")
+        print(f"  Official Avg.: {split_summary['official_split_avg']:.2f}%")
+        print(
+            f"  Pooled Acc.: {split_summary['pooled_accuracy']:.2f}% "
+            f"({split_summary['correct']}/{split_summary['total']})"
+        )
+
+    overall = summary.get("overall", {})
+    print(f"\n{'=' * 60}")
+    print(f"Official Total Avg.: {float(overall.get('official_total_avg', 0.0)):.2f}%")
+    print(
+        f"Pooled Overall Acc.: {float(overall.get('pooled_overall_accuracy', 0.0)):.2f}% "
+        f"({int(overall.get('correct', 0))}/{int(overall.get('total', 0))})"
+    )
+    print("=" * 60)
+
+
+def evaluate_siglip_top4_backward_realtime(
+    *,
+    anno: dict[str, Any],
+    split_name: str,
+    chunked_dir: str,
+    qa: RecentWindowQAModel,
+    siglip_encoder: SiglipFrameEncoder,
+    chunk_duration: float,
+    fps: float,
+    recent_frames_only: int,
+    max_analysis_frames: int,
+) -> dict[str, Any]:
+    video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    prompt = build_ovo_prompt(anno["task"], anno)
+    similarity_text = str(anno.get("question", "")).strip() or prompt
+    ground_truth = chr(65 + int(anno["gt"]))
+
+    chunks, decode_backend = decode_full_video_to_chunks(
+        video_path=video_path,
+        chunk_duration=chunk_duration,
+        fps=fps,
+    )
+    if not chunks:
+        raise ValueError(f"No chunks decoded from video: {video_path}")
+
+    frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
+    num_sampled_frames = len(frames)
+    del chunks
+
+    analysis_frame_indices, _analysis_recent_indices, analysis_sampling_strategy = build_analysis_subset(
+        total_frames=num_sampled_frames,
+        recent_indices=recent_indices,
+        max_analysis_frames=max_analysis_frames,
+    )
+    if not analysis_frame_indices:
+        raise ValueError(f"No analysis frames selected for video: {video_path}")
+
+    analysis_frames = [frames[frame_index] for frame_index in analysis_frame_indices]
+    siglip_features = siglip_encoder.encode_frames(analysis_frames)
+    siglip_question_feature = siglip_encoder.encode_text(similarity_text)
+    analysis_frame_scores = cosine_scores_against_query(siglip_features, siglip_question_feature).tolist()
+    del analysis_frames, siglip_features, siglip_question_feature
+
+    top_k = min(TOP_K_FRAMES, len(analysis_frame_scores))
+    ranked_candidate_positions = sorted(
+        range(len(analysis_frame_scores)),
+        key=lambda position: -float(analysis_frame_scores[position]),
+    )[:top_k]
+    selected_frame_indices_by_similarity = [
+        int(analysis_frame_indices[position]) for position in ranked_candidate_positions
+    ]
+    selected_frame_indices_for_inference = sorted(selected_frame_indices_by_similarity)
+    selected_frames = [frames[frame_index] for frame_index in selected_frame_indices_for_inference]
+
+    t0 = time.perf_counter()
+    response = qa.generate_from_frames(selected_frames, prompt)
+    generate_time = time.perf_counter() - t0
+
+    similarity_rank_by_frame_index = {
+        int(analysis_frame_indices[position]): rank
+        for rank, position in enumerate(ranked_candidate_positions, start=1)
+    }
+    similarity_score_by_frame_index = {
+        int(analysis_frame_indices[position]): float(analysis_frame_scores[position])
+        for position in ranked_candidate_positions
+    }
+    selected_frame_rows = [
+        {
+            "frame_index": int(frame_rows[frame_index]["frame_index"]),
+            "chunk_index": int(frame_rows[frame_index]["chunk_index"]),
+            "timestamp": float(frame_rows[frame_index]["timestamp"]),
+            "is_recent": bool(frame_rows[frame_index]["is_recent"]),
+            "similarity_score": similarity_score_by_frame_index[int(frame_index)],
+            "similarity_rank": similarity_rank_by_frame_index[int(frame_index)],
+        }
+        for frame_index in selected_frame_indices_for_inference
+    ]
+    final_chunk_ids = sorted({int(frame_rows[frame_index]["chunk_index"]) for frame_index in selected_frame_indices_for_inference})
+    correct = int(score_ovo_br(response, ground_truth))
+
+    del selected_frames
+
+    return {
+        "id": anno["id"],
+        "video": anno["video"],
+        "task": anno["task"],
+        "split": split_name,
+        "question": anno["question"],
+        "response": response,
+        "ground_truth": ground_truth,
+        "correct": correct,
+        "video_path": video_path,
+        "decode_backend": decode_backend,
+        "recent_chunk_ids": recent_chunk_ids,
+        "recent_frame_indices": recent_indices,
+        "num_sampled_frames": num_sampled_frames,
+        "num_candidate_frames": len(analysis_frame_indices),
+        "analysis_frame_indices": [int(index) for index in analysis_frame_indices],
+        "analysis_frame_scores": [float(score) for score in analysis_frame_scores],
+        "analysis_sampling_strategy": analysis_sampling_strategy,
+        "selected_frame_indices_by_similarity": selected_frame_indices_by_similarity,
+        "selected_frame_indices_for_inference": [int(index) for index in selected_frame_indices_for_inference],
+        "selected_frames": selected_frame_rows,
+        "final_chunk_ids": final_chunk_ids,
+        "generate_time": generate_time,
+        "ttft_seconds": float(getattr(qa, "_last_ttft_seconds", 0.0) or 0.0),
+        "num_vision_tokens": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_vision_tokens_before": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_vision_tokens_after": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_frames": int(getattr(qa, "_last_num_vision_frames", len(selected_frame_indices_for_inference)) or 0),
+    }
+
+
+def build_error_record(anno: dict[str, Any], split_name: str, chunked_dir: str, error: Exception) -> dict[str, Any]:
+    return {
+        "id": anno["id"],
+        "video": anno["video"],
+        "task": anno["task"],
+        "split": split_name,
+        "question": anno["question"],
+        "response": None,
+        "ground_truth": chr(65 + int(anno["gt"])),
+        "correct": 0,
+        "video_path": os.path.join(chunked_dir, f"{anno['id']}.mp4"),
+        "error": str(error),
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OVO-Bench full-frame evaluation for Qwen3-VL")
+    parser = argparse.ArgumentParser(description="OVO-Bench SigLIP top-4 frame evaluation for Qwen3-VL")
     parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
     parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
-    parser.add_argument("--result_dir", default="results/ovo_bench_full_frame_qwen3vl")
+    parser.add_argument("--result_dir", default="results/ovo_bench_siglip_top4_qwen3vl")
     parser.add_argument("--recent_frames_only", type=int, default=4)
-    parser.add_argument("--max_frames", type=int, default=32, help="Maximum number of frames to use per video. Recent frames are always included; remaining budget is filled uniformly.")
+    parser.add_argument(
+        "--max_analysis_frames",
+        "--max_frames",
+        dest="max_analysis_frames",
+        type=int,
+        default=32,
+        help="Maximum number of candidate frames scored by SigLIP before selecting top-4 for inference.",
+    )
     parser.add_argument("--chunk_duration", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max_qa_tokens", type=int, default=256)
+    parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
+    parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
+    parser.add_argument("--max_samples_per_split", type=int, default=None)
+    parser.add_argument("--max_samples_per_subset", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--model_device",
         choices=["local_process", "auto"],
@@ -167,53 +475,78 @@ def main() -> None:
             "'auto' uses Hugging Face device_map='auto' and requires --num_processes=1."
         ),
     )
-    parser.add_argument(
-        "--max_samples_per_split",
-        type=int,
-        default=None,
-        help="Optional smoke-test cap applied independently to backward/realtime after shuffle.",
-    )
     args = parser.parse_args()
 
+    if args.max_analysis_frames < 1:
+        raise ValueError("--max_analysis_frames must be >= 1")
+    if args.max_samples_per_split is not None and args.max_samples_per_split < 1:
+        raise ValueError("--max_samples_per_split must be >= 1 when provided.")
+    if args.max_samples_per_subset is not None and args.max_samples_per_subset < 1:
+        raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
+    if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
+        raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
+
     accelerator = Accelerator()
-
-    with open(args.anno_path) as handle:
-        annotations = json.load(handle)
-
-    backward_anno = [anno for anno in annotations if anno["task"] in BACKWARD_TASKS]
-    realtime_anno = [anno for anno in annotations if anno["task"] in REAL_TIME_TASKS]
-
-    random.seed(42)
-    random.shuffle(backward_anno)
-    random.shuffle(realtime_anno)
-    if args.max_samples_per_split is not None:
-        if args.max_samples_per_split < 1:
-            raise ValueError("--max_samples_per_split must be >= 1")
-        backward_anno = backward_anno[: args.max_samples_per_split]
-        realtime_anno = realtime_anno[: args.max_samples_per_split]
 
     if args.model_device == "auto" and accelerator.num_processes != 1:
         raise ValueError("--model_device=auto requires accelerate --num_processes=1.")
 
+    split_sample_cap = (
+        None
+        if args.max_samples_per_subset is not None
+        else smoke_cap_or_default(args.analysis_scope, args.max_samples_per_split)
+    )
+
+    with open(args.anno_path, encoding="utf-8") as handle:
+        annotations = json.load(handle)
+
+    rng = random.Random(args.seed)
+    backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
+        annotations,
+        BACKWARD_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
+    realtime_anno, realtime_available_counts, realtime_selected_counts = select_split_annotations(
+        annotations,
+        REAL_TIME_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
+
     accelerator.print(f"\n{'=' * 60}")
-    accelerator.print(f"OVO-Bench Full-Frame Evaluation ({MODEL_LABEL})")
+    accelerator.print(f"OVO-Bench SigLIP Top-4 Evaluation ({MODEL_LABEL})")
     accelerator.print(f"{'=' * 60}")
     accelerator.print(f"Backward: {len(backward_anno)}, Realtime: {len(realtime_anno)}")
     accelerator.print(f"Excluded forward tasks: {', '.join(EXCLUDED_FORWARD_TASKS)}")
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
         f"Window: recent_frames_only={args.recent_frames_only}, "
-        f"max_frames={args.max_frames}, "
+        f"max_analysis_frames={args.max_analysis_frames}, "
+        f"top_k={TOP_K_FRAMES}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
     )
-    if args.max_samples_per_split is not None:
-        accelerator.print(f"Smoke cap per split: {args.max_samples_per_split}")
+    accelerator.print(f"Scope: {args.analysis_scope}")
+    if args.max_samples_per_subset is not None:
+        accelerator.print(f"Sampling: up to {args.max_samples_per_subset} per subset/task")
+    elif split_sample_cap is not None:
+        accelerator.print(f"Sampling: up to {split_sample_cap} per split")
+    else:
+        accelerator.print("Sampling: full split")
+    accelerator.print(f"Backward subsets: {format_task_counts(BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
+    accelerator.print(f"Realtime subsets: {format_task_counts(REAL_TIME_TASKS, realtime_selected_counts, realtime_available_counts)}")
     accelerator.print(f"{'=' * 60}\n")
 
     evaluator = RecentWindowQAModel(
         model_name=args.model_path,
         device="auto" if args.model_device == "auto" else accelerator.device,
         max_new_tokens=args.max_qa_tokens,
+    )
+    siglip_encoder = SiglipFrameEncoder(
+        model_name=args.siglip_model_name,
+        device=accelerator.device,
     )
 
     with accelerator.split_between_processes(backward_anno) as local_backward:
@@ -227,71 +560,103 @@ def main() -> None:
         os.remove(done_path)
     backward_results, realtime_results, forward_results, done_keys = load_checkpoint_state(checkpoint_path)
 
-    with open(checkpoint_path, "a") as checkpoint_file:
-        for anno in tqdm(local_backward, desc=f"[GPU{accelerator.process_index}] Backward", disable=not accelerator.is_local_main_process):
-            key = make_ovo_key(anno)
-            if key in done_keys:
-                continue
-            result = evaluate_ovo_backward_realtime(
-                anno=anno,
-                chunked_dir=args.chunked_dir,
-                qa=evaluator,
-                chunk_duration=args.chunk_duration,
-                fps=args.fps,
-                recent_frames_only=args.recent_frames_only,
-                max_frames=args.max_frames,
-            )
-            backward_results.append(result)
-            done_keys.add(key)
-            append_checkpoint_row(checkpoint_file, result)
+    with open(checkpoint_path, "a", encoding="utf-8") as checkpoint_file:
+        split_jobs = (
+            ("backward", local_backward, backward_results),
+            ("realtime", local_realtime, realtime_results),
+        )
+        for split_name, local_annos, result_sink in split_jobs:
+            for anno in tqdm(
+                local_annos,
+                desc=f"[GPU{accelerator.process_index}] {split_name.title()}",
+                disable=not accelerator.is_local_main_process,
+            ):
+                key = make_ovo_key(anno)
+                if key in done_keys:
+                    continue
+                try:
+                    result = evaluate_siglip_top4_backward_realtime(
+                        anno=anno,
+                        split_name=split_name,
+                        chunked_dir=args.chunked_dir,
+                        qa=evaluator,
+                        siglip_encoder=siglip_encoder,
+                        chunk_duration=args.chunk_duration,
+                        fps=args.fps,
+                        recent_frames_only=args.recent_frames_only,
+                        max_analysis_frames=args.max_analysis_frames,
+                    )
+                except Exception as exc:
+                    result = build_error_record(anno, split_name, args.chunked_dir, exc)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-        for anno in tqdm(local_realtime, desc=f"[GPU{accelerator.process_index}] Realtime", disable=not accelerator.is_local_main_process):
-            key = make_ovo_key(anno)
-            if key in done_keys:
-                continue
-            result = evaluate_ovo_backward_realtime(
-                anno=anno,
-                chunked_dir=args.chunked_dir,
-                qa=evaluator,
-                chunk_duration=args.chunk_duration,
-                fps=args.fps,
-                recent_frames_only=args.recent_frames_only,
-                max_frames=args.max_frames,
-            )
-            realtime_results.append(result)
-            done_keys.add(key)
-            append_checkpoint_row(checkpoint_file, result)
+                result_sink.append(result)
+                done_keys.add(key)
+                append_checkpoint_row(checkpoint_file, result)
 
     write_done_marker(done_path)
 
     if accelerator.is_main_process:
         wait_for_done_markers(args.result_dir, accelerator.num_processes)
         all_backward, all_realtime, all_forward = merge_shard_results(args.result_dir, accelerator.num_processes)
-        print_ovo_results(MODEL_LABEL, all_backward, all_realtime, all_forward)
-        os.makedirs(args.result_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(args.result_dir, f"qwen3vl_full_frame_results_{timestamp}.json")
-        with open(output_path, "w") as handle:
-            json.dump(
-                {
-                    "config": {
-                        "model_path": args.model_path,
-                        "recent_frames_only": args.recent_frames_only,
-                        "max_frames": args.max_frames,
-                        "chunk_duration": args.chunk_duration,
-                        "fps": args.fps,
-                        "max_samples_per_split": args.max_samples_per_split,
-                        "excluded_forward_tasks": list(EXCLUDED_FORWARD_TASKS),
-                    },
-                    "backward": all_backward,
-                    "realtime": all_realtime,
-                    "forward": all_forward,
+
+        summary_config = {
+            "generated_at": datetime.now().isoformat(),
+            "model_label": MODEL_LABEL,
+            "model_path": args.model_path,
+            "siglip_model_name": args.siglip_model_name,
+            "anno_path": args.anno_path,
+            "chunked_dir": args.chunked_dir,
+            "result_dir": args.result_dir,
+            "analysis_scope": args.analysis_scope,
+            "recent_frames_only": args.recent_frames_only,
+            "max_analysis_frames": args.max_analysis_frames,
+            "top_k": TOP_K_FRAMES,
+            "chunk_duration": args.chunk_duration,
+            "fps": args.fps,
+            "max_qa_tokens": args.max_qa_tokens,
+            "max_samples_per_split": split_sample_cap,
+            "max_samples_per_subset": args.max_samples_per_subset,
+            "seed": args.seed,
+            "excluded_forward_tasks": list(EXCLUDED_FORWARD_TASKS),
+            "sampling_counts": {
+                "backward": {
+                    "available": backward_available_counts,
+                    "selected": backward_selected_counts,
                 },
-                handle,
-                indent=2,
-                ensure_ascii=False,
-            )
-        print(f"\nResults saved to: {output_path}")
+                "realtime": {
+                    "available": realtime_available_counts,
+                    "selected": realtime_selected_counts,
+                },
+            },
+        }
+        summary = build_eval_summary(
+            backward_results=all_backward,
+            realtime_results=all_realtime,
+            config=summary_config,
+        )
+        print_eval_summary(MODEL_LABEL, summary)
+
+        os.makedirs(args.result_dir, exist_ok=True)
+        summary_path = os.path.join(args.result_dir, "summary.json")
+        write_json(summary_path, summary)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(args.result_dir, f"qwen3vl_siglip_top4_results_{timestamp}.json")
+        write_json(
+            output_path,
+            {
+                "config": summary_config,
+                "summary": summary,
+                "backward": all_backward,
+                "realtime": all_realtime,
+                "forward": all_forward,
+            },
+        )
+        print(f"\nSummary saved to: {summary_path}")
+        print(f"Results saved to: {output_path}")
 
 
 if __name__ == "__main__":
