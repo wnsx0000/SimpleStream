@@ -432,6 +432,17 @@ def evaluate_attention_top4_backward_realtime(
     selected_frame_indices_for_inference = sorted(selected_frame_indices_by_attention)
     selected_frames = [frames[frame_index] for frame_index in selected_frame_indices_for_inference]
 
+    relative_position_denom = max(1, num_sampled_frames - 1)
+    selected_frame_relative_positions = [
+        float(frame_index) / float(relative_position_denom)
+        for frame_index in selected_frame_indices_for_inference
+    ]
+    selected_frame_mean_relative_position = (
+        float(sum(selected_frame_relative_positions)) / len(selected_frame_relative_positions)
+        if selected_frame_relative_positions
+        else 0.0
+    )
+
     t0 = time.perf_counter()
     response = qa.generate_from_frames(selected_frames, prompt)
     generate_time = time.perf_counter() - t0
@@ -482,6 +493,8 @@ def evaluate_attention_top4_backward_realtime(
         "selected_frame_indices_by_attention": selected_frame_indices_by_attention,
         "selected_frame_indices_for_inference": [int(index) for index in selected_frame_indices_for_inference],
         "selected_frames": selected_frame_rows,
+        "selected_frame_relative_positions": selected_frame_relative_positions,
+        "selected_frame_mean_relative_position": selected_frame_mean_relative_position,
         "final_chunk_ids": final_chunk_ids,
         "score_time": score_time,
         "generate_time": generate_time,

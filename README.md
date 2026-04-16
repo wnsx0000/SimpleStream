@@ -414,6 +414,21 @@ RUN_TAG=$(date +%Y%m%d_%H%M%S)
 CUDA_VISIBLE_DEVICES=4,5,6,7 BATCH_TAG="${RUN_TAG}" nohup bash main_experiments/run_qwen3vl_ovo_attn_top4_layers.sh 0,18,32,35 \
     > "./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layers_${RUN_TAG}.log" 2>&1 &
 ```
+
+Generate plots from a saved attention top-4 result directory. The script reads
+`results_incremental.jsonl`, computes the per-record mean relative position of
+the 4 selected frames within the sampled video (using the
+`selected_frame_relative_positions` / `selected_frame_mean_relative_position`
+fields written by the eval; falls back to recomputing from
+`selected_frame_indices_for_inference` and `num_sampled_frames` for older runs),
+and writes `plots/attn_top4_selected_position.png` with the same per-subset /
+split-avg / total-avg layout as the SigLIP test1 plot. The HLD backward
+subset is excluded.
+
+```bash
+python analysis/plot_attn_top4_selection.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_<RUN_TAG>
+```
 </details>
 
 ## 📢 Citation
