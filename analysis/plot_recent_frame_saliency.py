@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.frame_saliency_qwen3 import build_experiment_summary
+from lib.frame_saliency_qwen3 import build_experiment_summary, tie_aware_percentiles, topk_overlap
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 
 DISPLAY_LAYER_COUNT = 5
@@ -36,6 +36,14 @@ LINE_PLOT_SPECS = (
     ("top4_overlap_mean", "layer_recent4_top4_overlap_mean", "Recent4 Top4 Overlap", "Mean Overlap"),
     ("top4_overlap_std", "layer_recent4_top4_overlap_std", "Recent4 Top4 Overlap Std", "Std"),
 )
+
+BAR_PLOT_COLOR_MAP = {
+    "backward": "#6baed6",
+    "backward_avg": "#2171b5",
+    "realtime": "#fc9272",
+    "realtime_avg": "#cb181d",
+    "total_avg": "#525252",
+}
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -105,7 +113,26 @@ def ordered_task_names(summary: dict[str, Any]) -> list[str]:
 
 
 def extract_metric_series(metric: dict[str, Any], field_name: str) -> tuple[np.ndarray | None, np.ndarray | None]:
-    return normalized_metric_layer_array(metric, field_name)
+    display_indices, display_values = normalized_metric_layer_array(metric, field_name)
+
+    tail_field = field_name.replace("layer_", "tail_layer_", 1) if field_name.startswith("layer_") else None
+    tail_indices_raw = metric.get("tail_layer_indices", [])
+    tail_values_raw = metric.get(tail_field) if tail_field else None
+    if not tail_indices_raw or tail_values_raw is None:
+        return display_indices, display_values
+
+    tail_indices = np.asarray(tail_indices_raw, dtype=np.int64)
+    tail_values = np.asarray(tail_values_raw, dtype=np.float64)
+    if tail_values.ndim != 1 or tail_values.shape[0] != tail_indices.shape[0]:
+        return display_indices, display_values
+
+    if display_indices is None or display_values is None:
+        return tail_indices, tail_values
+
+    merged_indices = np.concatenate([display_indices, tail_indices])
+    merged_values = np.concatenate([display_values, tail_values])
+    order = np.argsort(merged_indices, kind="mergesort")
+    return merged_indices[order], merged_values[order]
 
 
 def metric_series_groups(summary: dict[str, Any], metric_name: str) -> list[tuple[str, dict[str, Any]]]:
@@ -728,13 +755,206 @@ def load_example_payloads(examples_dir: Path) -> list[tuple[Path, dict[str, Any]
     return payloads
 
 
+def compute_tail_layer_aggregates(
+    records: list[dict[str, Any]],
+    metric_name: str,
+) -> dict[str, Any] | None:
+    tail_indices_ref: list[int] | None = None
+    recent_means: list[list[float]] = []
+    overlaps: list[list[float]] = []
+
+    for record in records:
+        metric = record.get("metrics", {}).get(metric_name, {})
+        tail_indices = metric.get("tail_layer_indices")
+        tail_scores = metric.get("tail_layer_attention_scores")
+        recent_local = metric.get("recent_frame_indices_within_attention")
+        if not tail_indices or not tail_scores or not recent_local:
+            continue
+        if tail_indices_ref is None:
+            tail_indices_ref = [int(idx) for idx in tail_indices]
+        elif [int(idx) for idx in tail_indices] != tail_indices_ref:
+            continue
+
+        scores_arr = np.asarray(tail_scores, dtype=np.float64)
+        if scores_arr.ndim != 2 or scores_arr.shape[0] != len(tail_indices_ref):
+            continue
+
+        recent_set = [int(idx) for idx in recent_local]
+        per_layer_recent_mean: list[float] = []
+        per_layer_overlap: list[float] = []
+        for layer_scores in scores_arr:
+            score_list = layer_scores.tolist()
+            pcts = tie_aware_percentiles(score_list)
+            recent_pcts = [pcts[i] for i in recent_set if 0 <= i < len(pcts)]
+            per_layer_recent_mean.append(float(np.mean(recent_pcts)) if recent_pcts else 0.0)
+            per_layer_overlap.append(topk_overlap(score_list, recent_set, top_k=len(recent_set)))
+        recent_means.append(per_layer_recent_mean)
+        overlaps.append(per_layer_overlap)
+
+    if not recent_means or tail_indices_ref is None:
+        return None
+
+    recent_stack = np.asarray(recent_means, dtype=np.float64)
+    overlap_stack = np.asarray(overlaps, dtype=np.float64)
+    return {
+        "tail_layer_indices": list(tail_indices_ref),
+        "tail_layer_recent4_mean_percentile_mean": recent_stack.mean(axis=0).tolist(),
+        "tail_layer_recent4_mean_percentile_std": recent_stack.std(axis=0).tolist(),
+        "tail_layer_recent4_top4_overlap_mean": overlap_stack.mean(axis=0).tolist(),
+        "tail_layer_recent4_top4_overlap_std": overlap_stack.std(axis=0).tolist(),
+    }
+
+
+def inject_tail_layer_aggregates(summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    metric_names = [spec[0] for spec in ATTENTION_METRIC_SPECS]
+    for metric_name in metric_names:
+        total_metric = summary.get("metrics", {}).get(metric_name)
+        if isinstance(total_metric, dict):
+            total_stats = compute_tail_layer_aggregates(records, metric_name)
+            if total_stats:
+                total_metric.update(total_stats)
+
+        for split_name in ("backward", "realtime"):
+            split_records = [r for r in records if str(r.get("split", "")) == split_name]
+            split_metric = summary.get("splits", {}).get(split_name, {}).get("metrics", {}).get(metric_name)
+            if isinstance(split_metric, dict):
+                split_stats = compute_tail_layer_aggregates(split_records, metric_name)
+                if split_stats:
+                    split_metric.update(split_stats)
+
+        for task_name, task_obj in summary.get("tasks", {}).items():
+            task_records = [r for r in records if str(r.get("task", "")) == task_name]
+            task_metric = task_obj.get("metrics", {}).get(metric_name)
+            if isinstance(task_metric, dict):
+                task_stats = compute_tail_layer_aggregates(task_records, metric_name)
+                if task_stats:
+                    task_metric.update(task_stats)
+
+
+def extract_bar_plot_data(
+    summary: dict[str, Any],
+    metric_name: str,
+) -> tuple[list[str], list[float], list[float], list[str]]:
+    labels: list[str] = []
+    means: list[float] = []
+    stds: list[float] = []
+    group_types: list[str] = []
+
+    task_data = summary.get("tasks", {})
+
+    for task in REAL_TIME_TASKS:
+        if task in EXCLUDED_PLOT_TASKS or task not in task_data:
+            continue
+        m = task_data[task].get("metrics", {}).get(metric_name, {})
+        if not m:
+            continue
+        labels.append(task)
+        means.append(float(m.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(m.get("recent4_mean_percentile_std", 0.0)))
+        group_types.append("realtime")
+
+    rt_metric = summary.get("splits", {}).get("realtime", {}).get("metrics", {}).get(metric_name, {})
+    if rt_metric:
+        labels.append("Real-time\nAvg")
+        means.append(float(rt_metric.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(rt_metric.get("recent4_mean_percentile_std", 0.0)))
+        group_types.append("realtime_avg")
+
+    for task in BACKWARD_TASKS:
+        if task in EXCLUDED_PLOT_TASKS or task not in task_data:
+            continue
+        m = task_data[task].get("metrics", {}).get(metric_name, {})
+        if not m:
+            continue
+        labels.append(task)
+        means.append(float(m.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(m.get("recent4_mean_percentile_std", 0.0)))
+        group_types.append("backward")
+
+    bw_metric = summary.get("splits", {}).get("backward", {}).get("metrics", {}).get(metric_name, {})
+    if bw_metric:
+        labels.append("Backward\nAvg")
+        means.append(float(bw_metric.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(bw_metric.get("recent4_mean_percentile_std", 0.0)))
+        group_types.append("backward_avg")
+
+    total_metric = summary.get("metrics", {}).get(metric_name, {})
+    if total_metric:
+        labels.append("Total\nAvg")
+        means.append(float(total_metric.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(total_metric.get("recent4_mean_percentile_std", 0.0)))
+        group_types.append("total_avg")
+
+    return labels, means, stds, group_types
+
+
+def plot_attention_mean_percentile_bar(
+    summary: dict[str, Any],
+    metric_name: str,
+    file_prefix: str,
+    metric_title: str,
+    plots_dir: Path,
+) -> None:
+    labels, means, stds, group_types = extract_bar_plot_data(summary, metric_name)
+    if not labels:
+        return
+
+    n = len(labels)
+    x = np.arange(n)
+    colors = [BAR_PLOT_COLOR_MAP[g] for g in group_types]
+    edge_colors = [BAR_PLOT_COLOR_MAP[g] for g in group_types]
+
+    fig, ax = plt.subplots(figsize=(max(10, n * 0.9), 6))
+    ax.bar(
+        x, means,
+        color=colors, edgecolor=edge_colors,
+        linewidth=1.2,
+    )
+    for i, (mean_val, std_val) in enumerate(zip(means, stds)):
+        ax.text(i, mean_val + 0.01, f"{mean_val:.3f}", ha="center", va="bottom", fontsize=8.5, fontweight="bold")
+        ax.text(i, mean_val + 0.01 + 0.04, f"std={std_val:.3f}", ha="center", va="bottom", fontsize=7, color="#555555")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Mean Percentile", fontsize=11)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(f"Recent-4 {metric_title}: Mean Percentile by Task", fontsize=13)
+    ax.grid(axis="y", alpha=0.3, linewidth=0.6)
+
+    separator_positions = [i + 0.5 for i in range(n - 1) if group_types[i] != group_types[i + 1]]
+    for pos in separator_positions:
+        ax.axvline(pos, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+
+    fig.tight_layout()
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plots_dir / f"{file_prefix}_recent4_mean_percentile_bar.png"
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_attention_mean_percentile_bars(summary: dict[str, Any], plots_dir: Path) -> None:
+    plots_dir = ensure_dir(plots_dir)
+    for metric_name, file_prefix, metric_title in ATTENTION_METRIC_SPECS:
+        if metric_name not in summary.get("metrics", {}):
+            continue
+        plot_attention_mean_percentile_bar(
+            summary,
+            metric_name=metric_name,
+            file_prefix=file_prefix,
+            metric_title=metric_title,
+            plots_dir=plots_dir,
+        )
+
+
 def generate_top_level_plots(records: list[dict[str, Any]], plots_dir: Path) -> None:
     plots_dir = ensure_dir(plots_dir)
     if not records:
         return
 
     summary = build_experiment_summary(records, config={})
+    inject_tail_layer_aggregates(summary, records)
     plot_attention_line_plots(summary, plots_dir)
+    plot_attention_mean_percentile_bars(summary, plots_dir)
 
 
 def generate_plots(result_dir: str | Path) -> None:

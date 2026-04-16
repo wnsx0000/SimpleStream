@@ -65,8 +65,10 @@ def extract_bar_data(
         stds.append(rt_metrics.get("recent4_mean_percentile_std", 0.0))
         group_types.append("realtime_avg")
 
-    # Backward tasks
+    # Backward tasks (exclude HLD)
     for task in BACKWARD_TASKS:
+        if task == "HLD":
+            continue
         if task not in task_data:
             continue
         m = task_data[task].get("metrics", {}).get(backend, {})

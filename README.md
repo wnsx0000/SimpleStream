@@ -163,6 +163,17 @@ python scoring/score_ovo_bench.py \
 
 ## Additional Experiments
 
+
+<details>
+<summary><b>main results directory</b></summary>
+
+- qwen3-vl-8B reproducing: ovo_qwen3vl_recent4
+- test1-1 (SigLIP cosine similarity mean percentile): ovo_qwen3vl_siglip_subset20_20260415_151005
+- test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260415_185231
+- test2 (SigLIP top-4 frame inference): ovo_qwen3vl_siglip_top4_all_20260415_205218
+
+</details>
+
 <details>
 <summary><b>Qwen3-VL on OVO-Bench</b></summary>
 
