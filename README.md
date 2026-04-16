@@ -268,7 +268,7 @@ Generate plots later from a saved result directory.
 
 ```bash
 python analysis/plot_recent_frame_saliency.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset1_20260415_180521
+    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset20_20260415_185231
 ```
 
 siglip similarity test.
@@ -361,7 +361,23 @@ Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
 accuracy, split-level official averages and pooled accuracy, plus
 `Official Total Avg.` and `Pooled Overall Acc.` for the full run.
 
-attention top-4 test.
+attention top-4 test. candidate layers -> 0, 18, 32, 35
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_$(date +%Y%m%d_%H%M%S) \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --layer_number 0 \
+    --attn_implementation eager \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer0_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
 
 ```bash
 CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
@@ -377,6 +393,38 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py
     --chunk_duration 1.0 \
     --fps 1.0 \
     > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer18_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer32_$(date +%Y%m%d_%H%M%S) \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --layer_number 32 \
+    --attn_implementation eager \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer32_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer35_$(date +%Y%m%d_%H%M%S) \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --layer_number 35 \
+    --attn_implementation eager \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer35_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 </details>
 
