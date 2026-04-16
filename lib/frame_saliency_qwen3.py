@@ -14,10 +14,12 @@ from PIL import Image
 from lib.recent_window_eval import decode_video_to_chunks_qwen, select_attention_frame_indices
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel as _BaseQwen3RecentWindowQAModel
 
-DISPLAY_LAYER_COUNT = 10
-QUESTION_PREFILL_DISPLAY_LAYER_COUNT = 5
+DISPLAY_LAYER_COUNT = 12
+QUESTION_PREFILL_ANCHOR_LAYER_COUNT = 5
+QUESTION_PREFILL_TAIL_LAYER_COUNT = 8
 QUESTION_PREFILL_FRAME_MAP_MAX_BINS = 96
 QUESTION_PREFILL_QUESTION_MAP_MAX_BINS = 32
+EXCLUDED_SUMMARY_TASKS = frozenset({"HLD"})
 
 
 def parse_csv_options(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -80,16 +82,6 @@ def tie_aware_percentiles(scores: list[float]) -> list[float]:
     return (ranks / float(arr.size - 1)).tolist()
 
 
-def topk_overlap(scores: list[float], selected_indices: list[int], top_k: int | None = None) -> float:
-    if not scores or not selected_indices:
-        return 0.0
-    k = int(top_k or len(selected_indices))
-    k = max(1, min(k, len(scores)))
-    top_indices = np.argsort(-np.asarray(scores, dtype=np.float64), kind="mergesort")[:k]
-    overlap = len(set(int(idx) for idx in top_indices.tolist()) & set(int(idx) for idx in selected_indices))
-    return float(overlap / max(len(selected_indices), 1))
-
-
 def summarize_scalar_metric(scores: list[float], recent_indices: list[int]) -> dict[str, Any]:
     percentiles = tie_aware_percentiles(scores)
     recent_percentiles = [float(percentiles[idx]) for idx in recent_indices if 0 <= idx < len(percentiles)]
@@ -97,7 +89,6 @@ def summarize_scalar_metric(scores: list[float], recent_indices: list[int]) -> d
         "frame_scores": [float(score) for score in scores],
         "frame_percentiles": [float(value) for value in percentiles],
         "recent4_mean_percentile": float(np.mean(recent_percentiles)) if recent_percentiles else 0.0,
-        "recent4_top4_overlap": topk_overlap(scores, recent_indices, top_k=len(recent_indices)),
     }
 
 
@@ -126,6 +117,13 @@ def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_C
     return selected
 
 
+def question_prefill_layer_indices(total_count: int) -> list[int]:
+    anchors = uniform_center_indices(total_count, QUESTION_PREFILL_ANCHOR_LAYER_COUNT)
+    tail_start = max(0, int(total_count) - QUESTION_PREFILL_TAIL_LAYER_COUNT)
+    tail = list(range(tail_start, max(0, int(total_count))))
+    return sorted(set(anchors + tail))
+
+
 def summarize_layerwise_metric(
     layer_scores: torch.Tensor,
     recent_indices: list[int],
@@ -141,7 +139,10 @@ def summarize_layerwise_metric(
         dtype=torch.float32,
     )
     if display_layer_indices is None:
-        display_layer_indices = uniform_center_indices(layer_scores.shape[0], display_layer_count)
+        if int(display_layer_count) == DISPLAY_LAYER_COUNT:
+            display_layer_indices = question_prefill_layer_indices(layer_scores.shape[0])
+        else:
+            display_layer_indices = uniform_center_indices(layer_scores.shape[0], display_layer_count)
     else:
         display_layer_indices = [int(index) for index in display_layer_indices]
     display_layer_scores = layer_scores[display_layer_indices]
@@ -150,31 +151,20 @@ def summarize_layerwise_metric(
         float(layer_percentiles[idx, recent_indices].mean().item()) if recent_indices else 0.0
         for idx in display_layer_indices
     ]
-    display_layer_overlap = [
-        topk_overlap(layer_scores[idx].tolist(), recent_indices, top_k=len(recent_indices))
-        for idx in display_layer_indices
-    ]
 
     mean_scores = layer_scores.mean(dim=0)
     mean_summary = summarize_scalar_metric(mean_scores.tolist(), recent_indices)
 
     num_layers = int(layer_scores.shape[0])
-    tail_layer_indices = sorted(set(range(max(0, num_layers - 8), num_layers)) - set(display_layer_indices))
-    tail_layer_scores = layer_scores[tail_layer_indices] if tail_layer_indices else torch.empty(0, layer_scores.shape[1])
-
     return {
         "num_layers_total": num_layers,
         "display_layer_indices": [int(index) for index in display_layer_indices],
         "layer_attention_scores": display_layer_scores.tolist(),
         "layer_attention_percentiles": display_layer_percentiles.tolist(),
         "layer_recent4_mean_percentile": [float(value) for value in display_layer_recent_mean],
-        "layer_recent4_top4_overlap": [float(value) for value in display_layer_overlap],
-        "tail_layer_indices": [int(index) for index in tail_layer_indices],
-        "tail_layer_attention_scores": tail_layer_scores.tolist(),
         "mean_attention_score": mean_summary["frame_scores"],
         "mean_percentile": mean_summary["frame_percentiles"],
         "recent4_mean_percentile": mean_summary["recent4_mean_percentile"],
-        "recent4_top4_overlap": mean_summary["recent4_top4_overlap"],
     }
 
 
@@ -190,7 +180,7 @@ def sample_metric_layer_field(metric: dict[str, Any], field: str) -> tuple[np.nd
     if len(saved_indices) == values.shape[0]:
         return values, saved_indices
 
-    display_indices = uniform_center_indices(values.shape[0], DISPLAY_LAYER_COUNT)
+    display_indices = question_prefill_layer_indices(values.shape[0])
     if not display_indices:
         return None, []
     return values[display_indices], display_indices
@@ -996,13 +986,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             if "question_prefill" in attention_modes:
                 text_layers = self._get_text_layers()
                 num_text_layers = len(text_layers)
-                question_prefill_display_layers = uniform_center_indices(
-                    num_text_layers,
-                    QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
-                )
-                question_prefill_tail_layers = sorted(
-                    set(range(max(0, num_text_layers - 8), num_text_layers)) - set(question_prefill_display_layers)
-                )
+                question_prefill_display_layers = question_prefill_layer_indices(num_text_layers)
                 question_only_inputs = self._build_cached_multimodal_inputs(
                     cached_embeds=attention_embeds,
                     cached_grid_thw=attention_grid,
@@ -1024,7 +1008,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     num_layers=len(text_layers),
                     save_raw=save_raw_attentions,
                     map_layer_indices=(
-                        sorted(set(question_prefill_display_layers + question_prefill_tail_layers))
+                        question_prefill_display_layers
                         if map_metadata is not None
                         else None
                     ),
@@ -1044,7 +1028,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 metrics["question_prefill_attention"] = summarize_layerwise_metric(
                     prefill_scores,
                     recent_indices=attention_recent_indices,
-                    display_layer_count=QUESTION_PREFILL_DISPLAY_LAYER_COUNT,
                     display_layer_indices=question_prefill_display_layers,
                 )
                 metrics["question_prefill_attention"]["attention_frame_indices"] = attention_frame_indices
@@ -1053,8 +1036,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 if save_example_matrices:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["question_prefill_attention_scores"] = prefill_scores[display_layer_indices]
-                    export_layer_indices = sorted(set(display_layer_indices) | set(question_prefill_tail_layers))
-                    attention_map_payload = prefill_collector.export_question_prefill_attention_maps(export_layer_indices)
+                    attention_map_payload = prefill_collector.export_question_prefill_attention_maps(display_layer_indices)
                     if attention_map_payload is not None:
                         example_payload["question_prefill_attention_maps"] = attention_map_payload
                 if save_raw_attentions:
@@ -1065,55 +1047,6 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                         if int(layer_idx) in prefill_collector.layer_raw_attentions
                     }
                 del prefill_scores, prefill_collector
-                release_unused_cuda_memory()
-
-            # Collect frame-level decode attention for the first generated token and summarize it.
-            if "first_token" in attention_modes:
-                full_prompt_inputs = self._build_cached_multimodal_inputs(
-                    cached_embeds=attention_embeds,
-                    cached_grid_thw=attention_grid,
-                    frame_token_counts=attention_frame_token_counts,
-                    question=prompt,
-                )
-                prefill_outputs = self._run_with_collector(
-                    None,
-                    input_ids=None,
-                    inputs_embeds=full_prompt_inputs["inputs_embeds"],
-                    attention_mask=full_prompt_inputs["attention_mask"],
-                    position_ids=full_prompt_inputs["position_ids"],
-                )
-                prefill_past_key_values = prefill_outputs.past_key_values
-                first_token = prefill_outputs.logits[:, -1, :].argmax(dim=-1)
-                del prefill_outputs
-                release_unused_cuda_memory()
-                decode_collector = LayerwiseFrameAttentionCollector(
-                    frame_token_spans=full_prompt_inputs["frame_token_spans"],
-                    query_positions=[0],
-                    num_layers=len(self._get_text_layers()),
-                    save_raw=save_raw_attentions,
-                )
-                _decode_output = self._run_with_collector(
-                    decode_collector,
-                    use_cache=False,
-                    input_ids=first_token[:, None],
-                    past_key_values=prefill_past_key_values,
-                )
-                del _decode_output, full_prompt_inputs, prefill_past_key_values
-                decode_scores = decode_collector.as_tensor()
-                metrics["first_token_attention"] = summarize_layerwise_metric(
-                    decode_scores,
-                    recent_indices=attention_recent_indices,
-                )
-                metrics["first_token_attention"]["attention_frame_indices"] = attention_frame_indices
-                metrics["first_token_attention"]["recent_frame_indices_within_attention"] = attention_recent_indices
-                metrics["first_token_attention"]["attention_sampling_strategy"] = attention_sampling_strategy
-                if save_example_matrices:
-                    display_layer_indices = metrics["first_token_attention"]["display_layer_indices"]
-                    example_payload["first_token_attention_scores"] = decode_scores[display_layer_indices]
-                    example_payload["first_token_id"] = int(first_token.item())
-                if save_raw_attentions:
-                    example_payload["raw_first_token_attentions"] = decode_collector.layer_raw_attentions
-                del decode_scores, decode_collector, first_token
                 release_unused_cuda_memory()
 
             del attention_embeds, attention_grid, attention_frame_token_counts, attention_index_lookup
@@ -1195,7 +1128,7 @@ def build_frame_saliency_analyzer(
 
 def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metrics: bool = False) -> dict[str, Any]:
     scalar_metric_names = ["siglip_similarity"]
-    attention_metric_names = ["question_prefill_attention", "first_token_attention"]
+    attention_metric_names = ["question_prefill_attention"]
     valid_records = [record for record in records if not record.get("error")]
     summary: dict[str, Any] = {
         "total_records": len(records),
@@ -1226,30 +1159,23 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
                         [item["recent4_mean_percentile"] for item in values],
                         "recent4_mean_percentile",
                     ),
-                    **summarize_stats(
-                        [item["recent4_top4_overlap"] for item in values],
-                        "recent4_top4_overlap",
-                    ),
                 }
 
         for name in attention_metric_names:
             values = [record["metrics"][name] for record in metric_records if name in record.get("metrics", {})]
             if values:
                 layer_recent_rows: list[np.ndarray] = []
-                layer_overlap_rows: list[np.ndarray] = []
                 display_layer_indices: list[int] = []
                 num_layers_total: int | None = None
                 for item in values:
                     recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile")
-                    overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap")
-                    if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
+                    if recent_row is None:
                         continue
                     if display_layer_indices and recent_indices != display_layer_indices:
                         continue
                     if not display_layer_indices:
                         display_layer_indices = list(recent_indices)
                     layer_recent_rows.append(recent_row)
-                    layer_overlap_rows.append(overlap_row)
                     if num_layers_total is None and item.get("num_layers_total") is not None:
                         num_layers_total = int(item["num_layers_total"])
 
@@ -1259,19 +1185,12 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
                         [item["recent4_mean_percentile"] for item in values],
                         "recent4_mean_percentile",
                     ),
-                    **summarize_stats(
-                        [item["recent4_top4_overlap"] for item in values],
-                        "recent4_top4_overlap",
-                    ),
                 }
-                if layer_recent_rows and layer_overlap_rows:
+                if layer_recent_rows:
                     stacked_recent = np.vstack(layer_recent_rows).astype(np.float64, copy=False)
-                    stacked_overlap = np.vstack(layer_overlap_rows).astype(np.float64, copy=False)
                     summary_payload["display_layer_indices"] = display_layer_indices
                     summary_payload["layer_recent4_mean_percentile_mean"] = stacked_recent.mean(axis=0).tolist()
                     summary_payload["layer_recent4_mean_percentile_std"] = stacked_recent.std(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_mean"] = stacked_overlap.mean(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_std"] = stacked_overlap.std(axis=0).tolist()
                 if num_layers_total is not None:
                     summary_payload["num_layers_total"] = num_layers_total
                 metrics_summary[name] = summary_payload
@@ -1294,10 +1213,6 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
                         [item["recent4_mean_percentile_mean"] for item in values],
                         "recent4_mean_percentile",
                     ),
-                    **summarize_stats(
-                        [item["recent4_top4_overlap_mean"] for item in values],
-                        "recent4_top4_overlap",
-                    ),
                 }
 
         for name in attention_metric_names:
@@ -1308,20 +1223,17 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
             ]
             if values:
                 layer_recent_rows: list[np.ndarray] = []
-                layer_overlap_rows: list[np.ndarray] = []
                 display_layer_indices: list[int] = []
                 num_layers_total: int | None = None
                 for item in values:
                     recent_row, recent_indices = sample_metric_layer_field(item, "layer_recent4_mean_percentile_mean")
-                    overlap_row, overlap_indices = sample_metric_layer_field(item, "layer_recent4_top4_overlap_mean")
-                    if recent_row is None or overlap_row is None or recent_row.shape != overlap_row.shape:
+                    if recent_row is None:
                         continue
                     if display_layer_indices and recent_indices != display_layer_indices:
                         continue
                     if not display_layer_indices:
                         display_layer_indices = list(recent_indices)
                     layer_recent_rows.append(recent_row)
-                    layer_overlap_rows.append(overlap_row)
                     if num_layers_total is None and item.get("num_layers_total") is not None:
                         num_layers_total = int(item["num_layers_total"])
 
@@ -1331,19 +1243,12 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
                         [item["recent4_mean_percentile_mean"] for item in values],
                         "recent4_mean_percentile",
                     ),
-                    **summarize_stats(
-                        [item["recent4_top4_overlap_mean"] for item in values],
-                        "recent4_top4_overlap",
-                    ),
                 }
-                if layer_recent_rows and layer_overlap_rows:
+                if layer_recent_rows:
                     stacked_recent = np.vstack(layer_recent_rows).astype(np.float64, copy=False)
-                    stacked_overlap = np.vstack(layer_overlap_rows).astype(np.float64, copy=False)
                     summary_payload["display_layer_indices"] = display_layer_indices
                     summary_payload["layer_recent4_mean_percentile_mean"] = stacked_recent.mean(axis=0).tolist()
                     summary_payload["layer_recent4_mean_percentile_std"] = stacked_recent.std(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_mean"] = stacked_overlap.mean(axis=0).tolist()
-                    summary_payload["layer_recent4_top4_overlap_std"] = stacked_overlap.std(axis=0).tolist()
                 if num_layers_total is not None:
                     summary_payload["num_layers_total"] = num_layers_total
                 task_mean_metrics[name] = summary_payload
@@ -1371,6 +1276,9 @@ def summarize_record_slice(records: list[dict[str, Any]], include_task_mean_metr
 
 
 def build_experiment_summary(records: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    records = [
+        record for record in records if str(record.get("task", "")) not in EXCLUDED_SUMMARY_TASKS
+    ]
     summary = {
         "config": config,
         **summarize_record_slice(records),

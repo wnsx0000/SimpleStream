@@ -170,7 +170,7 @@ python scoring/score_ovo_bench.py \
 - qwen3-vl-8B reproducing: ovo_qwen3vl_recent4
 - test1-1 (SigLIP cosine similarity mean percentile): ovo_qwen3vl_siglip_subset20_20260415_151005
 - test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260415_185231
-- test2 (SigLIP top-4 frame inference): ovo_qwen3vl_siglip_top4_all_20260415_205218
+- test2 (SigLIP top-4 frame inference with `uniform_with_recent_anchor` candidates): ovo_qwen3vl_siglip_top4_all_20260415_205218
 
 </details>
 
@@ -198,7 +198,10 @@ Measures whether the `recent4` frames selected by SimpleStream are also salient
 among all sampled frames in the same window for the OVO-Bench backward and
 realtime splits. The script computes:
 - SigLIP-SO400M frame-question similarity
-- Layer-wise Qwen3 attention scores for `question_prefill` and `first_token`
+- Layer-wise Qwen3 attention scores for `question_prefill`
+
+The HLD backward-tracing subset is excluded from Test 1 measurement, summaries,
+averages, and plots.
 
 Outputs are saved under `records.jsonl`, `summary.json`, and `examples/`.
 The top-level fields in `summary.json` remain pooled across the analyzed records,
@@ -208,9 +211,9 @@ and `summary["splits"]["realtime"]`. Each split section also includes
 with equal task weight. Metric summaries now include both `*_mean` and `*_std`
 fields. Plot generation is run separately with
 `python analysis/plot_recent_frame_saliency.py --result-dir <result_dir>`.
-The pooled `plots/` directory contains the 4 layer-wise line plots per attention
-mode plus aggregate heatmaps, while `plots/backward/` and `plots/realtime/`
-contain split-specific layer heatmaps only.
+The pooled `plots/` directory contains the question-prefill layer-wise mean and
+std line plots, a task/split/total mean-percentile bar plot, saved-example
+heatmaps, and saved-example average attention maps.
 Example exports use task/subset caps: `--save_example_matrices 3` means up to
 3 saved examples per OVO task such as `ASI`, `EPM`, or `STU`, not 3 total.
 When `question_prefill` example exports are enabled, each saved example also
@@ -235,7 +238,10 @@ backward/realtime splits. When `--max_samples_per_subset` is set, it overrides
 the default smoke split cap.
 
 question_prefill test.
-This run saves 5 uniformly spaced decoder layers, including the first and last.
+For Qwen3-VL-8B, this run saves 12 decoder layers:
+`0, 9, 18, 26, 28, 29, 30, 31, 32, 33, 34, 35`. These are the union of 5
+uniform anchor layers (`0, 9, 18, 26, 35`) and the final 8-layer tail window
+(`28` through `35`).
 Saved example plots include both frame-to-frame and question-to-frame pooled
 attention maps, plus averages over the saved example subset.
 
@@ -294,6 +300,7 @@ python analysis/plot_siglip_similarity.py \
 <summary><b>Test 2</b></summary>
 
 Runs OVO-Bench backward/realtime evaluation with SigLIP-guided frame selection.
+The HLD backward-tracing subset is excluded.
 For each sample, the script first builds a candidate frame pool from the full
 decoded video (up to `--max_analysis_frames` frames using the same
 `uniform_with_recent_anchor` policy as Test 1), computes cosine similarity
@@ -312,18 +319,18 @@ alias of `--max_analysis_frames` for backward compatibility.
 siglip top-4 subset20 test.
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S) \
+    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S)_always_recent4 \
     --analysis_scope full \
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
     --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S)_always_recent4.log 2>&1 &
 ```
 </details>
 

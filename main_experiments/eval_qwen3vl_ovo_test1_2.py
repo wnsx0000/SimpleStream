@@ -31,13 +31,13 @@ def main() -> None:
         default_result_dir="results/ovo_saliency_qwen3vl_attention",
         include_save_raw_attn_examples=True,
     )
-    parser.add_argument("--attention_modes", default="question_prefill,first_token")
+    parser.add_argument("--attention_modes", default="question_prefill")
     parser.add_argument("--attn_implementation", default="eager")
     parser.add_argument("--max_new_tokens", type=int, default=32)
     args = parser.parse_args()
 
     attention_modes = parse_csv_options(args.attention_modes)
-    supported_attention = {"first_token", "question_prefill"}
+    supported_attention = {"question_prefill"}
     unsupported_attention = sorted(set(attention_modes) - supported_attention)
     if unsupported_attention:
         raise ValueError(f"Unsupported attention modes: {unsupported_attention}")

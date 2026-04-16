@@ -2,7 +2,6 @@
 # Sequential full-subset saliency runs for Qwen3-VL:
 # 1) question_prefill attention
 # 2) SigLIP similarity
-# 3) first_token attention
 
 set -euo pipefail
 
@@ -79,7 +78,6 @@ run_case() {
 
 run_case "question_prefill" "main_experiments/eval_qwen3vl_ovo_test1_2.py" "question_prefill"
 run_case "siglip" "main_experiments/eval_qwen3vl_ovo_test1_1.py"
-run_case "first_token" "main_experiments/eval_qwen3vl_ovo_test1_2.py" "first_token"
 
 echo
 echo "Completed batch ${BATCH_TAG}"

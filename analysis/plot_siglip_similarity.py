@@ -12,13 +12,32 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from lib.frame_saliency_qwen3 import build_experiment_summary
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
+
+EXCLUDED_PLOT_TASKS = frozenset({"HLD"})
 
 
 def load_summary(result_dir: Path) -> dict[str, Any]:
     path = result_dir / "summary.json"
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def filter_excluded_tasks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if str(record.get("task", "")) not in EXCLUDED_PLOT_TASKS]
 
 
 def detect_similarity_backend(summary: dict[str, Any]) -> str:
@@ -30,6 +49,55 @@ def detect_similarity_backend(summary: dict[str, Any]) -> str:
         if "similarity" in key:
             return key
     raise ValueError("Cannot detect similarity backend from summary.json")
+
+
+def task_average_metric(task_summaries: dict[str, Any], backend: str) -> dict[str, Any]:
+    metrics = [
+        task_summary.get("metrics", {}).get(backend, {})
+        for task, task_summary in task_summaries.items()
+        if task not in EXCLUDED_PLOT_TASKS
+    ]
+    metrics = [metric for metric in metrics if metric]
+    if not metrics:
+        return {}
+    return {
+        "count": int(sum(metric.get("count", 0) for metric in metrics)),
+        "recent4_mean_percentile_mean": float(
+            np.mean([metric.get("recent4_mean_percentile_mean", 0.0) for metric in metrics])
+        ),
+        "recent4_mean_percentile_std": float(
+            np.mean([metric.get("recent4_mean_percentile_std", 0.0) for metric in metrics])
+        ),
+    }
+
+
+def filtered_summary_fallback(summary: dict[str, Any], backend: str) -> dict[str, Any]:
+    filtered = dict(summary)
+    filtered["tasks"] = {
+        task: task_summary
+        for task, task_summary in summary.get("tasks", {}).items()
+        if task not in EXCLUDED_PLOT_TASKS
+    }
+    filtered["metrics"] = {}
+    total_metric = task_average_metric(filtered["tasks"], backend)
+    if total_metric:
+        filtered["metrics"][backend] = total_metric
+
+    splits: dict[str, Any] = {}
+    for split_name, split_summary in summary.get("splits", {}).items():
+        split_copy = dict(split_summary)
+        split_copy["tasks"] = {
+            task: task_summary
+            for task, task_summary in split_summary.get("tasks", {}).items()
+            if task not in EXCLUDED_PLOT_TASKS
+        }
+        split_copy["metrics"] = {}
+        split_metric = task_average_metric(split_copy["tasks"], backend)
+        if split_metric:
+            split_copy["metrics"][backend] = split_metric
+        splits[split_name] = split_copy
+    filtered["splits"] = splits
+    return filtered
 
 
 def extract_bar_data(
@@ -52,45 +120,48 @@ def extract_bar_data(
         if task not in task_data:
             continue
         m = task_data[task].get("metrics", {}).get(backend, {})
+        if not m:
+            continue
         labels.append(task)
-        means.append(m.get("recent4_mean_percentile_mean", 0.0))
-        stds.append(m.get("recent4_mean_percentile_std", 0.0))
+        means.append(float(m.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(m.get("recent4_mean_percentile_std", 0.0)))
         group_types.append("realtime")
 
     # Real-time average
     rt_metrics = summary.get("splits", {}).get("realtime", {}).get("metrics", {}).get(backend, {})
     if rt_metrics:
         labels.append("Real-time\nAvg")
-        means.append(rt_metrics.get("recent4_mean_percentile_mean", 0.0))
-        stds.append(rt_metrics.get("recent4_mean_percentile_std", 0.0))
+        means.append(float(rt_metrics.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(rt_metrics.get("recent4_mean_percentile_std", 0.0)))
         group_types.append("realtime_avg")
 
-    # Backward tasks (exclude HLD)
     for task in BACKWARD_TASKS:
-        if task == "HLD":
+        if task in EXCLUDED_PLOT_TASKS:
             continue
         if task not in task_data:
             continue
         m = task_data[task].get("metrics", {}).get(backend, {})
+        if not m:
+            continue
         labels.append(task)
-        means.append(m.get("recent4_mean_percentile_mean", 0.0))
-        stds.append(m.get("recent4_mean_percentile_std", 0.0))
+        means.append(float(m.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(m.get("recent4_mean_percentile_std", 0.0)))
         group_types.append("backward")
 
     # Backward average
     bw_metrics = summary.get("splits", {}).get("backward", {}).get("metrics", {}).get(backend, {})
     if bw_metrics:
         labels.append("Backward\nAvg")
-        means.append(bw_metrics.get("recent4_mean_percentile_mean", 0.0))
-        stds.append(bw_metrics.get("recent4_mean_percentile_std", 0.0))
+        means.append(float(bw_metrics.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(bw_metrics.get("recent4_mean_percentile_std", 0.0)))
         group_types.append("backward_avg")
 
     # Total average
     total_metrics = summary.get("metrics", {}).get(backend, {})
     if total_metrics:
         labels.append("Total\nAvg")
-        means.append(total_metrics.get("recent4_mean_percentile_mean", 0.0))
-        stds.append(total_metrics.get("recent4_mean_percentile_std", 0.0))
+        means.append(float(total_metrics.get("recent4_mean_percentile_mean", 0.0)))
+        stds.append(float(total_metrics.get("recent4_mean_percentile_std", 0.0)))
         group_types.append("total_avg")
 
     return labels, means, stds, group_types
@@ -156,6 +227,11 @@ def generate_plots(result_dir: str | Path) -> None:
     result_dir = Path(result_dir)
     summary = load_summary(result_dir)
     backend = detect_similarity_backend(summary)
+    records = filter_excluded_tasks(load_jsonl(result_dir / "records.jsonl"))
+    if records:
+        summary = build_experiment_summary(records, config=summary.get("config", {}))
+    else:
+        summary = filtered_summary_fallback(summary, backend)
     plots_dir = result_dir / "plots"
     plot_mean_percentile_bar(summary, backend, plots_dir)
 

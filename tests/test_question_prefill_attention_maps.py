@@ -16,35 +16,76 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from analysis.plot_recent_frame_saliency import generate_plots  # noqa: E402
+from analysis.plot_recent_frame_saliency import generate_plots as generate_attention_plots  # noqa: E402
+from analysis.plot_siglip_similarity import (  # noqa: E402
+    extract_bar_data as extract_siglip_bar_data,
+    filter_excluded_tasks as filter_siglip_excluded_tasks,
+    generate_plots as generate_siglip_plots,
+)
 from lib.frame_saliency_qwen3 import (  # noqa: E402
     allocate_proportional_bin_counts,
+    build_experiment_summary,
     build_question_prefill_attention_map_metadata,
     build_question_prefill_attention_maps,
+    question_prefill_layer_indices,
 )
+from lib.recent_window_eval import select_attention_frame_indices  # noqa: E402
 
 
 class QuestionPrefillAttentionMapTests(unittest.TestCase):
     @staticmethod
     def _synthetic_attention_metric(offset: float) -> dict[str, object]:
+        layer_indices = question_prefill_layer_indices(36)
         base = np.asarray(
-            [
-                [1.0e-10, 2.0e-10, 4.0e-10],
-                [1.5e-10, 3.0e-10, 6.0e-10],
-                [2.0e-10, 4.0e-10, 8.0e-10],
-            ],
+            [[(layer_pos + 1) * 1.0e-10, (layer_pos + 2) * 1.0e-10, (layer_pos + 4) * 1.0e-10]
+             for layer_pos in range(len(layer_indices))],
             dtype=np.float32,
         )
         return {
             "recent4_mean_percentile": 0.25 + offset,
-            "recent4_top4_overlap": 0.10 + offset,
-            "layer_recent4_mean_percentile": [0.20 + offset, 0.30 + offset, 0.40 + offset],
-            "layer_recent4_top4_overlap": [0.05 + offset, 0.10 + offset, 0.15 + offset],
-            "display_layer_indices": [0, 12, 24],
+            "layer_recent4_mean_percentile": [
+                0.20 + offset + float(layer_pos) * 0.01
+                for layer_pos in range(len(layer_indices))
+            ],
+            "display_layer_indices": layer_indices,
             "layer_attention_scores": (base + np.float32(offset * 1.0e-4)).tolist(),
             "attention_frame_indices": [10, 20, 30],
             "recent_frame_indices_within_attention": [1, 2],
         }
+
+    def test_question_prefill_layer_indices_for_qwen3vl_8b(self) -> None:
+        self.assertEqual(
+            question_prefill_layer_indices(36),
+            [0, 9, 18, 26, 28, 29, 30, 31, 32, 33, 34, 35],
+        )
+
+    def test_build_experiment_summary_excludes_hld(self) -> None:
+        records = [
+            {
+                "split": "backward",
+                "task": "ASI",
+                "metrics": {"question_prefill_attention": self._synthetic_attention_metric(0.0)},
+            },
+            {
+                "split": "backward",
+                "task": "HLD",
+                "metrics": {"question_prefill_attention": self._synthetic_attention_metric(0.5)},
+            },
+        ]
+        summary = build_experiment_summary(records, config={})
+        self.assertEqual(summary["total_records"], 1)
+        self.assertIn("ASI", summary["tasks"])
+        self.assertNotIn("HLD", summary["tasks"])
+
+    def test_uniform_with_recent_anchor_includes_recent_frames(self) -> None:
+        selected, strategy = select_attention_frame_indices(
+            total_frames=100,
+            recent_indices=[96, 97, 98, 99],
+            max_analysis_frames=12,
+        )
+        self.assertEqual(strategy, "uniform_with_recent_anchor")
+        self.assertTrue({96, 97, 98, 99}.issubset(set(selected)))
+        self.assertEqual(len(selected), 12)
 
     def test_allocate_proportional_bin_counts(self) -> None:
         counts = [4, 8, 12]
@@ -128,14 +169,14 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
                 "recent_frame_indices": [1, 2],
                 "metrics": {},
                 "question_prefill_attention_maps": {
-                    "frame_frame_maps": torch.linspace(0.0, 1.0, steps=5 * 6 * 6, dtype=torch.float32).reshape(5, 6, 6),
+                    "frame_frame_maps": torch.linspace(0.0, 1.0, steps=12 * 6 * 6, dtype=torch.float32).reshape(12, 6, 6),
                     "question_frame_maps": torch.linspace(
                         0.0,
                         1.0,
-                        steps=5 * 3 * 6,
+                        steps=12 * 3 * 6,
                         dtype=torch.float32,
-                    ).reshape(5, 3, 6),
-                    "display_layer_indices": [0, 9, 18, 27, 35],
+                    ).reshape(12, 3, 6),
+                    "display_layer_indices": question_prefill_layer_indices(36),
                     "attention_frame_indices": [10, 20, 30],
                     "frame_bin_slices": [[0, 2], [2, 4], [4, 6]],
                     "frame_bin_labels": ["10", "20", "30"],
@@ -144,7 +185,7 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
             }
             torch.save(payload, examples_dir / "sample.pt")
 
-            generate_plots(result_dir)
+            generate_attention_plots(result_dir)
 
             self.assertTrue((result_dir / "plots" / "question_prefill_frame_frame_maps_average.png").exists())
             self.assertTrue((result_dir / "plots" / "question_prefill_question_frame_maps_average.png").exists())
@@ -207,16 +248,16 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
                     "frame_frame_maps": torch.linspace(
                         1.0e-10,
                         9.0e-10,
-                        steps=3 * 3 * 3,
+                        steps=12 * 3 * 3,
                         dtype=torch.float32,
-                    ).reshape(3, 3, 3),
+                    ).reshape(12, 3, 3),
                     "question_frame_maps": torch.linspace(
                         1.0e-10,
                         6.0e-10,
-                        steps=3 * 2 * 3,
+                        steps=12 * 2 * 3,
                         dtype=torch.float32,
-                    ).reshape(3, 2, 3),
-                    "display_layer_indices": [0, 12, 24],
+                    ).reshape(12, 2, 3),
+                    "display_layer_indices": question_prefill_layer_indices(36),
                     "attention_frame_indices": [10, 20, 30],
                     "frame_bin_slices": [[0, 1], [1, 2], [2, 3]],
                     "frame_bin_labels": ["10", "20", "30"],
@@ -231,7 +272,7 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
             torch.save(allowed_payload, examples_dir / "asi_sample.pt")
             torch.save(filtered_payload, examples_dir / "hld_sample.pt")
 
-            generate_plots(result_dir)
+            generate_attention_plots(result_dir)
 
             self.assertTrue((result_dir / "plots" / "question_prefill_percentile_mean.png").exists())
             self.assertTrue((result_dir / "plots" / "question_prefill_percentile_mean_pooled.png").exists())
@@ -240,6 +281,56 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
                 (result_dir / "plots" / "examples" / "asi_sample" / "question_prefill_attention_heatmap.png").exists()
             )
             self.assertFalse((result_dir / "plots" / "examples" / "hld_sample").exists())
+
+    def test_siglip_plotting_filters_hld_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result_dir = Path(tmp_dir)
+            records = [
+                {
+                    "_key": "ASI:1",
+                    "split": "backward",
+                    "task": "ASI",
+                    "metrics": {
+                        "siglip_similarity": {
+                            "recent4_mean_percentile": 0.25,
+                        },
+                    },
+                },
+                {
+                    "_key": "HLD:2",
+                    "split": "backward",
+                    "task": "HLD",
+                    "metrics": {
+                        "siglip_similarity": {
+                            "recent4_mean_percentile": 0.99,
+                        },
+                    },
+                },
+            ]
+            with (result_dir / "records.jsonl").open("w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+            with (result_dir / "summary.json").open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "config": {"similarity_backends": ["siglip"]},
+                        "metrics": {"siglip_similarity": {}},
+                    },
+                    handle,
+                )
+
+            generate_siglip_plots(result_dir)
+
+            self.assertTrue((result_dir / "plots" / "similarity_mean_percentile.png").exists())
+            summary = build_experiment_summary(
+                filter_siglip_excluded_tasks(records),
+                config={"similarity_backends": ["siglip"]},
+            )
+            labels, means, _stds, _group_types = extract_siglip_bar_data(summary, "siglip_similarity")
+            self.assertNotIn("HLD", labels)
+            self.assertIn("ASI", labels)
+            self.assertEqual(means[labels.index("Backward\nAvg")], 0.25)
+            self.assertEqual(means[labels.index("Total\nAvg")], 0.25)
 
 
 if __name__ == "__main__":

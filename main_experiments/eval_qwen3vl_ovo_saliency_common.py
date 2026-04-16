@@ -139,7 +139,6 @@ def print_metric_summary(summary: dict[str, Any]) -> None:
     metric_labels = {
         "siglip_similarity": "SigLIP similarity",
         "question_prefill_attention": "Question prefill attention",
-        "first_token_attention": "First token attention",
     }
     metrics = summary.get("metrics", {})
     if not metrics:
@@ -154,13 +153,9 @@ def print_metric_summary(summary: dict[str, Any]) -> None:
             stats.get("recent4_mean_percentile_mean"),
             stats.get("recent4_mean_percentile_std"),
         )
-        overlap = format_mean_std(
-            stats.get("recent4_top4_overlap_mean"),
-            stats.get("recent4_top4_overlap_std"),
-        )
         print(
-            f"  {label}: recent4_mean_percentile={mean_percentile}, "
-            f"recent4_top4_overlap={overlap} (n={stats.get('count', 0)})"
+            f"  {label}: recent4_mean_percentile={mean_percentile} "
+            f"(n={stats.get('count', 0)})"
         )
 
 
@@ -244,7 +239,9 @@ def run_saliency_experiment(
     print(f"Result Dir: {result_dir}")
     print("=" * 60 + "\n")
 
-    all_records = list(existing_records)
+    all_records = [
+        record for record in existing_records if str(record.get("task", "")) not in EXCLUDED_BACKWARD_TASKS
+    ]
 
     with records_path.open("a", encoding="utf-8") as handle:
         for split_name, split_annos in (("backward", backward_anno), ("realtime", realtime_anno)):

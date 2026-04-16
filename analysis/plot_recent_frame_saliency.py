@@ -15,10 +15,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.frame_saliency_qwen3 import build_experiment_summary, tie_aware_percentiles, topk_overlap
+from lib.frame_saliency_qwen3 import build_experiment_summary, question_prefill_layer_indices
 from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 
-DISPLAY_LAYER_COUNT = 5
 QUESTION_PREFILL_FRAME_FRAME_AVERAGE_SHAPE = (64, 64)
 QUESTION_PREFILL_QUESTION_FRAME_AVERAGE_SHAPE = (64, 64)
 EXCLUDED_PLOT_TASKS = frozenset({"HLD"})
@@ -28,13 +27,10 @@ TASK_PLOT_ORDER = [
 ]
 ATTENTION_METRIC_SPECS = (
     ("question_prefill_attention", "question_prefill", "Question Prefill Attention"),
-    ("first_token_attention", "first_token", "First Token Attention"),
 )
 LINE_PLOT_SPECS = (
     ("percentile_mean", "layer_recent4_mean_percentile_mean", "Recent4 Mean Percentile", "Mean Percentile"),
     ("percentile_std", "layer_recent4_mean_percentile_std", "Recent4 Mean Percentile Std", "Std"),
-    ("top4_overlap_mean", "layer_recent4_top4_overlap_mean", "Recent4 Top4 Overlap", "Mean Overlap"),
-    ("top4_overlap_std", "layer_recent4_top4_overlap_std", "Recent4 Top4 Overlap Std", "Std"),
 )
 
 BAR_PLOT_COLOR_MAP = {
@@ -77,16 +73,6 @@ def filter_excluded_tasks(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [record for record in records if str(record.get("task", "")) not in EXCLUDED_PLOT_TASKS]
 
 
-def uniform_center_indices(total_count: int, target_count: int = DISPLAY_LAYER_COUNT) -> list[int]:
-    total_count = int(total_count)
-    target_count = int(target_count)
-    if total_count <= 0 or target_count <= 0:
-        return []
-    if total_count <= target_count:
-        return list(range(total_count))
-    return [int(round(x)) for x in np.linspace(0, total_count - 1, target_count)]
-
-
 def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[np.ndarray | None, np.ndarray | None]:
     if field not in metric:
         return None, None
@@ -99,7 +85,7 @@ def normalized_metric_layer_array(metric: dict[str, Any], field: str) -> tuple[n
     if saved_indices.size == values.shape[0]:
         return saved_indices, values
 
-    sampled_indices = np.asarray(uniform_center_indices(values.shape[0], DISPLAY_LAYER_COUNT), dtype=np.int64)
+    sampled_indices = np.asarray(question_prefill_layer_indices(values.shape[0]), dtype=np.int64)
     if sampled_indices.size < 1:
         return None, None
     return sampled_indices, values[sampled_indices]
@@ -113,26 +99,7 @@ def ordered_task_names(summary: dict[str, Any]) -> list[str]:
 
 
 def extract_metric_series(metric: dict[str, Any], field_name: str) -> tuple[np.ndarray | None, np.ndarray | None]:
-    display_indices, display_values = normalized_metric_layer_array(metric, field_name)
-
-    tail_field = field_name.replace("layer_", "tail_layer_", 1) if field_name.startswith("layer_") else None
-    tail_indices_raw = metric.get("tail_layer_indices", [])
-    tail_values_raw = metric.get(tail_field) if tail_field else None
-    if not tail_indices_raw or tail_values_raw is None:
-        return display_indices, display_values
-
-    tail_indices = np.asarray(tail_indices_raw, dtype=np.int64)
-    tail_values = np.asarray(tail_values_raw, dtype=np.float64)
-    if tail_values.ndim != 1 or tail_values.shape[0] != tail_indices.shape[0]:
-        return display_indices, display_values
-
-    if display_indices is None or display_values is None:
-        return tail_indices, tail_values
-
-    merged_indices = np.concatenate([display_indices, tail_indices])
-    merged_values = np.concatenate([display_values, tail_values])
-    order = np.argsort(merged_indices, kind="mergesort")
-    return merged_indices[order], merged_values[order]
+    return normalized_metric_layer_array(metric, field_name)
 
 
 def metric_series_groups(summary: dict[str, Any], metric_name: str) -> list[tuple[str, dict[str, Any]]]:
@@ -645,26 +612,12 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
 
     for metric_name, title in (
         ("question_prefill_attention", "Question Prefill"),
-        ("first_token_attention", "First Token"),
     ):
         if metric_name not in metrics:
             continue
         layer_indices, matrix = normalized_metric_layer_array(metrics[metric_name], "layer_attention_scores")
         if layer_indices is None or matrix is None:
             continue
-
-        # Merge tail (last-4) layers if available
-        tail_indices = metrics[metric_name].get("tail_layer_indices", [])
-        tail_scores = metrics[metric_name].get("tail_layer_attention_scores", [])
-        if tail_indices and tail_scores:
-            tail_indices_arr = np.asarray(tail_indices, dtype=np.int64)
-            tail_matrix = np.asarray(tail_scores, dtype=matrix.dtype)
-            if tail_matrix.ndim == 2 and tail_matrix.shape[1] == matrix.shape[1]:
-                merged_indices = np.concatenate([layer_indices, tail_indices_arr])
-                merged_matrix = np.concatenate([matrix, tail_matrix], axis=0)
-                sort_order = np.argsort(merged_indices)
-                layer_indices = merged_indices[sort_order]
-                matrix = merged_matrix[sort_order]
 
         x_positions = np.asarray(
             metrics[metric_name].get("attention_frame_indices", list(range(matrix.shape[1]))),
@@ -753,82 +706,6 @@ def load_example_payloads(examples_dir: Path) -> list[tuple[Path, dict[str, Any]
             continue
         payloads.append((example_path, payload))
     return payloads
-
-
-def compute_tail_layer_aggregates(
-    records: list[dict[str, Any]],
-    metric_name: str,
-) -> dict[str, Any] | None:
-    tail_indices_ref: list[int] | None = None
-    recent_means: list[list[float]] = []
-    overlaps: list[list[float]] = []
-
-    for record in records:
-        metric = record.get("metrics", {}).get(metric_name, {})
-        tail_indices = metric.get("tail_layer_indices")
-        tail_scores = metric.get("tail_layer_attention_scores")
-        recent_local = metric.get("recent_frame_indices_within_attention")
-        if not tail_indices or not tail_scores or not recent_local:
-            continue
-        if tail_indices_ref is None:
-            tail_indices_ref = [int(idx) for idx in tail_indices]
-        elif [int(idx) for idx in tail_indices] != tail_indices_ref:
-            continue
-
-        scores_arr = np.asarray(tail_scores, dtype=np.float64)
-        if scores_arr.ndim != 2 or scores_arr.shape[0] != len(tail_indices_ref):
-            continue
-
-        recent_set = [int(idx) for idx in recent_local]
-        per_layer_recent_mean: list[float] = []
-        per_layer_overlap: list[float] = []
-        for layer_scores in scores_arr:
-            score_list = layer_scores.tolist()
-            pcts = tie_aware_percentiles(score_list)
-            recent_pcts = [pcts[i] for i in recent_set if 0 <= i < len(pcts)]
-            per_layer_recent_mean.append(float(np.mean(recent_pcts)) if recent_pcts else 0.0)
-            per_layer_overlap.append(topk_overlap(score_list, recent_set, top_k=len(recent_set)))
-        recent_means.append(per_layer_recent_mean)
-        overlaps.append(per_layer_overlap)
-
-    if not recent_means or tail_indices_ref is None:
-        return None
-
-    recent_stack = np.asarray(recent_means, dtype=np.float64)
-    overlap_stack = np.asarray(overlaps, dtype=np.float64)
-    return {
-        "tail_layer_indices": list(tail_indices_ref),
-        "tail_layer_recent4_mean_percentile_mean": recent_stack.mean(axis=0).tolist(),
-        "tail_layer_recent4_mean_percentile_std": recent_stack.std(axis=0).tolist(),
-        "tail_layer_recent4_top4_overlap_mean": overlap_stack.mean(axis=0).tolist(),
-        "tail_layer_recent4_top4_overlap_std": overlap_stack.std(axis=0).tolist(),
-    }
-
-
-def inject_tail_layer_aggregates(summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
-    metric_names = [spec[0] for spec in ATTENTION_METRIC_SPECS]
-    for metric_name in metric_names:
-        total_metric = summary.get("metrics", {}).get(metric_name)
-        if isinstance(total_metric, dict):
-            total_stats = compute_tail_layer_aggregates(records, metric_name)
-            if total_stats:
-                total_metric.update(total_stats)
-
-        for split_name in ("backward", "realtime"):
-            split_records = [r for r in records if str(r.get("split", "")) == split_name]
-            split_metric = summary.get("splits", {}).get(split_name, {}).get("metrics", {}).get(metric_name)
-            if isinstance(split_metric, dict):
-                split_stats = compute_tail_layer_aggregates(split_records, metric_name)
-                if split_stats:
-                    split_metric.update(split_stats)
-
-        for task_name, task_obj in summary.get("tasks", {}).items():
-            task_records = [r for r in records if str(r.get("task", "")) == task_name]
-            task_metric = task_obj.get("metrics", {}).get(metric_name)
-            if isinstance(task_metric, dict):
-                task_stats = compute_tail_layer_aggregates(task_records, metric_name)
-                if task_stats:
-                    task_metric.update(task_stats)
 
 
 def extract_bar_plot_data(
@@ -952,7 +829,6 @@ def generate_top_level_plots(records: list[dict[str, Any]], plots_dir: Path) -> 
         return
 
     summary = build_experiment_summary(records, config={})
-    inject_tail_layer_aggregates(summary, records)
     plot_attention_line_plots(summary, plots_dir)
     plot_attention_mean_percentile_bars(summary, plots_dir)
 
