@@ -270,6 +270,13 @@ CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_
     --siglip_model_name google/siglip-so400m-patch14-384 \
     > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
+
+Generate plots from a saved SigLIP similarity result directory.
+
+```bash
+python analysis/plot_siglip_similarity.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_siglip_subset20_20260415_151005
+```
 </details>
 
 <details>
