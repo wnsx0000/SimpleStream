@@ -12,6 +12,17 @@ from lib.recent_window_eval import (
 )
 
 
+def _is_cached_vision_generation_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    if "v must have shape (total_k, num_heads_k, head_size)" in message:
+        return True
+    return (
+        "The size of tensor a" in message
+        and "must match the size of tensor b" in message
+        and "dimension 3" in message
+    )
+
+
 class RecentWindowQAModel(_BaseRecentWindowQAModel):
     """Qwen3 release wrapper aligned with the cached single-block builder."""
 
@@ -126,7 +137,7 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
             cached_embeds, cached_grid_thw = self.encode_vision(frames)
             return self.generate_with_cached_vision(cached_embeds, cached_grid_thw, question)
         except RuntimeError as exc:
-            if "v must have shape (total_k, num_heads_k, head_size)" not in str(exc):
+            if not _is_cached_vision_generation_error(exc):
                 raise
             self._use_cached_vision_path = False
             if torch.cuda.is_available():
