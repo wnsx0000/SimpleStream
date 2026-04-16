@@ -80,7 +80,7 @@ CUDA_VISIBLE_DEVICES=0,1 nohup accelerate launch --num_processes=2 \
     --result_dir main_experiments/results/ovo_qwen3vl_recent8 \
     --recent_frames_only 8 \
     --chunk_duration 1.0 \
-    --fps 1.0 \
+    --fps 1.0
 ```
 
 Or use the convenience launcher for 4-GPU:
@@ -331,6 +331,52 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py
     --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
     > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S)_always_recent4.log 2>&1 &
+```
+</details>
+
+<details>
+<summary><b>Test 3</b></summary>
+
+Runs OVO-Bench backward/realtime evaluation with attention-guided top-4 frame
+selection. For each sample, the script builds a candidate frame pool from the
+full decoded video using the same `uniform_with_recent_anchor` policy as
+Test 1/2 (recent frames are always included; the remaining budget up to
+`--max_analysis_frames` is filled uniformly), prefills Qwen3-VL on those
+frames plus the question, captures question-prefill self-attention at the
+decoder layer specified by `--layer_number`, sums attention over each frame's
+vision-token span to produce a per-frame score, selects the top-4 frames, and
+then reorders them temporally before running Qwen3-VL inference on just those
+four frames. The HLD backward-tracing subset is excluded.
+
+`--layer_number` is required. `--attn_implementation eager` is required
+because the scoring path needs attention weights (flash-attention does not
+return them). With `--max_analysis_frames 12 --recent_frames_only 4`, the
+candidate pool is exactly "recent 4 + uniform 8".
+
+Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
+`qwen3vl_attn_top4_results_*.json`. Each record includes
+`analysis_frame_indices`, `analysis_frame_scores`, `scoring_layer`,
+`selected_frame_indices_by_attention`, and
+`selected_frame_indices_for_inference`. `summary.json` reports subset/task
+accuracy, split-level official averages and pooled accuracy, plus
+`Official Total Avg.` and `Pooled Overall Acc.` for the full run.
+
+attention top-4 test.
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer18_$(date +%Y%m%d_%H%M%S) \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --layer_number 18 \
+    --attn_implementation eager \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer18_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 </details>
 
