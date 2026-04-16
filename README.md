@@ -363,68 +363,34 @@ accuracy, split-level official averages and pooled accuracy, plus
 
 attention top-4 test. candidate layers -> 0, 18, 32, 35
 
-```bash
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_$(date +%Y%m%d_%H%M%S) \
-    --recent_frames_only 4 \
-    --max_analysis_frames 12 \
-    --layer_number 0 \
-    --attn_implementation eager \
-    --model_device auto \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer0_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
+Run one layer manually:
 
 ```bash
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+LAYER=0
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=5,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer18_$(date +%Y%m%d_%H%M%S) \
+    --result_dir "main_experiments/results/ovo_qwen3vl_attn_top4_layer${LAYER}_${RUN_TAG}" \
     --recent_frames_only 4 \
     --max_analysis_frames 12 \
-    --layer_number 18 \
+    --layer_number "${LAYER}" \
     --attn_implementation eager \
     --model_device auto \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer18_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    > "./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer${LAYER}_${RUN_TAG}.log" 2>&1 &
 ```
 
-```bash
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer32_$(date +%Y%m%d_%H%M%S) \
-    --recent_frames_only 4 \
-    --max_analysis_frames 12 \
-    --layer_number 32 \
-    --attn_implementation eager \
-    --model_device auto \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer32_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-```
+Run multiple layer candidates sequentially by passing a comma-separated layer
+list. The script executes layers in the given order, reusing one batch tag for
+all result directories and per-layer logs.
 
 ```bash
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_attn_top4_layer35_$(date +%Y%m%d_%H%M%S) \
-    --recent_frames_only 4 \
-    --max_analysis_frames 12 \
-    --layer_number 35 \
-    --attn_implementation eager \
-    --model_device auto \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer35_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 BATCH_TAG="${RUN_TAG}" nohup bash main_experiments/run_qwen3vl_ovo_attn_top4_layers.sh 0,18,32,35 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layers_${RUN_TAG}.log" 2>&1 &
 ```
 </details>
 
