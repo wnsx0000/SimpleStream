@@ -420,6 +420,23 @@ def mean_pool_2d_by_spans(
     return pooled_sum / areas
 
 
+def mean_pool_rows_by_spans(
+    matrix: torch.Tensor,
+    row_spans: list[tuple[int, int]],
+) -> torch.Tensor:
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected a 2D tensor for row pooling, got shape={tuple(matrix.shape)}")
+    if not row_spans:
+        return torch.empty((0, matrix.shape[1]), dtype=matrix.dtype, device=matrix.device)
+
+    prefix = F.pad(matrix.cumsum(dim=0), (0, 0, 1, 0))
+    row_starts = torch.tensor([int(start) for start, _ in row_spans], dtype=torch.long, device=matrix.device)
+    row_ends = torch.tensor([int(end) for _, end in row_spans], dtype=torch.long, device=matrix.device)
+    pooled_sum = prefix[row_ends] - prefix[row_starts]
+    lengths = (row_ends - row_starts).to(dtype=matrix.dtype)[:, None]
+    return pooled_sum / lengths
+
+
 def build_question_prefill_attention_maps(
     attn_weights: torch.Tensor,
     metadata: QuestionPrefillAttentionMapMetadata,
@@ -446,6 +463,10 @@ def build_question_prefill_attention_maps(
             question_attention,
             metadata.question_local_bin_spans,
             metadata.frame_local_bin_spans,
+        ).detach().cpu(),
+        "question_frame_token_map": mean_pool_rows_by_spans(
+            question_attention,
+            metadata.question_local_bin_spans,
         ).detach().cpu(),
     }
 
@@ -567,6 +588,87 @@ class LayerwiseFrameAttentionCollector:
             "frame_bin_slices": [[int(start), int(end)] for start, end in metadata.frame_bin_slices],
             "frame_bin_labels": list(metadata.frame_bin_labels),
             "question_bin_labels": list(metadata.question_bin_labels),
+        }
+
+    def export_question_prefill_sink_bin_token_attention(
+        self,
+        display_layer_indices: list[int],
+    ) -> dict[str, Any] | None:
+        metadata = self.question_prefill_map_metadata
+        if metadata is None or not display_layer_indices:
+            return None
+
+        question_frame_maps: list[torch.Tensor] = []
+        question_frame_token_maps: list[torch.Tensor] = []
+        for layer_idx in display_layer_indices:
+            layer_payload = self.layer_attention_maps.get(int(layer_idx))
+            if layer_payload is None:
+                return None
+            question_frame_maps.append(layer_payload["question_frame_map"])
+            question_frame_token_maps.append(layer_payload["question_frame_token_map"])
+
+        stacked_question_frame_maps = torch.stack(question_frame_maps, dim=0)
+        if stacked_question_frame_maps.ndim != 3 or stacked_question_frame_maps.shape[-1] < 1:
+            return None
+
+        frame_scores = []
+        for start, end in metadata.frame_bin_slices:
+            start = int(start)
+            end = int(end)
+            if end <= start:
+                continue
+            frame_scores.append(stacked_question_frame_maps[:, :, start:end].float().mean())
+        if not frame_scores:
+            return None
+        sink_bin_scores = torch.stack(frame_scores, dim=0)
+        sink_bin_index = int(torch.argmax(sink_bin_scores).item())
+        if sink_bin_index < 0 or sink_bin_index >= len(metadata.frame_bin_slices):
+            return None
+
+        sink_frame_bin_start, sink_frame_bin_end = metadata.frame_bin_slices[sink_bin_index]
+        sink_frame_bin_start = int(sink_frame_bin_start)
+        sink_frame_bin_end = int(sink_frame_bin_end)
+        if sink_frame_bin_end <= sink_frame_bin_start:
+            return None
+
+        sink_token_start = int(metadata.frame_local_bin_spans[sink_frame_bin_start][0])
+        sink_token_end = int(metadata.frame_local_bin_spans[sink_frame_bin_end - 1][1])
+        sink_token_start = int(sink_token_start)
+        sink_token_end = int(sink_token_end)
+        if sink_token_end <= sink_token_start:
+            return None
+
+        stacked_token_maps = torch.stack(question_frame_token_maps, dim=0)
+        sink_token_maps = stacked_token_maps[:, :, sink_token_start:sink_token_end].contiguous()
+        sink_frame_label = (
+            metadata.frame_bin_labels[sink_bin_index]
+            if sink_bin_index < len(metadata.frame_bin_labels)
+            else ""
+        )
+        sink_frame_index = (
+            metadata.attention_frame_indices[sink_bin_index]
+            if sink_bin_index < len(metadata.attention_frame_indices)
+            else None
+        )
+        sink_token_count = sink_token_end - sink_token_start
+
+        return {
+            "maps": sink_token_maps.detach().cpu(),
+            "display_layer_indices": [int(index) for index in display_layer_indices],
+            "question_bin_labels": list(metadata.question_bin_labels),
+            "sink_bin_index": sink_bin_index,
+            "sink_bin_score": float(sink_bin_scores[sink_bin_index].item()),
+            "sink_frame_label": str(sink_frame_label),
+            "sink_frame_index": int(sink_frame_index) if sink_frame_index is not None else None,
+            "sink_frame_local_index": sink_bin_index,
+            "sink_frame_bin_start": sink_frame_bin_start,
+            "sink_frame_bin_end": sink_frame_bin_end,
+            "sink_token_start": sink_token_start,
+            "sink_token_end": sink_token_end,
+            "sink_global_token_start": int(metadata.frame_token_start + sink_token_start),
+            "sink_global_token_end": int(metadata.frame_token_start + sink_token_end),
+            "token_labels": [f"tok{index}" for index in range(sink_token_count)],
+            "selection_rule": "sample_common_max_question_frame_mean",
         }
 
 
@@ -1039,6 +1141,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     attention_map_payload = prefill_collector.export_question_prefill_attention_maps(display_layer_indices)
                     if attention_map_payload is not None:
                         example_payload["question_prefill_attention_maps"] = attention_map_payload
+                    sink_bin_token_payload = prefill_collector.export_question_prefill_sink_bin_token_attention(
+                        display_layer_indices,
+                    )
+                    if sink_bin_token_payload is not None:
+                        example_payload["question_prefill_sink_bin_token_attention"] = sink_bin_token_payload
                 if save_raw_attentions:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["raw_question_prefill_attentions"] = {

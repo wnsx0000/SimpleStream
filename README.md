@@ -72,7 +72,7 @@ Downloaded automatically from HuggingFace on first run:
 <summary><b>Qwen3-VL on OVO-Bench</b></summary>
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes=2 \
+CUDA_VISIBLE_DEVICES=0,1 nohup accelerate launch --num_processes=2 \
     main_experiments/eval_qwen3vl_ovo.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
@@ -80,7 +80,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes=2 \
     --result_dir main_experiments/results/ovo_qwen3vl_recent8 \
     --recent_frames_only 8 \
     --chunk_duration 1.0 \
-    --fps 1.0
+    --fps 1.0 \
 ```
 
 Or use the convenience launcher for 4-GPU:

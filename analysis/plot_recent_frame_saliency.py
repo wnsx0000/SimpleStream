@@ -324,6 +324,18 @@ def question_prefill_map_payload(payload: dict[str, Any]) -> dict[str, Any] | No
     return value
 
 
+def question_prefill_sink_bin_token_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    value = payload.get("question_prefill_sink_bin_token_attention")
+    if not isinstance(value, dict):
+        return None
+    maps = to_numpy_array(value.get("maps"))
+    if maps is None or maps.ndim != 3:
+        return None
+    if maps.shape[0] < 1 or maps.shape[1] < 1 or maps.shape[2] < 1:
+        return None
+    return value
+
+
 def frame_slice_centers(frame_bin_slices: list[list[int]] | list[tuple[int, int]]) -> np.ndarray:
     return np.asarray(
         [0.5 * (int(start) + int(end) - 1) for start, end in frame_bin_slices],
@@ -389,6 +401,18 @@ def apply_frame_ticks(
 def apply_question_ticks(ax: Any, question_bin_labels: list[str]) -> None:
     ax.set_yticks(np.arange(len(question_bin_labels)))
     ax.set_yticklabels(question_bin_labels, fontsize=7)
+
+
+def apply_token_ticks(ax: Any, token_labels: list[str], max_ticks: int = 12) -> None:
+    if not token_labels:
+        return
+    num_tokens = len(token_labels)
+    if num_tokens <= max_ticks:
+        positions = np.arange(num_tokens)
+    else:
+        positions = np.unique(np.linspace(0, num_tokens - 1, max_ticks, dtype=np.int64))
+    ax.set_xticks(positions)
+    ax.set_xticklabels([token_labels[int(index)] for index in positions], rotation=90, fontsize=7)
 
 
 def apply_relative_ticks(ax: Any, *, width: int, height: int, mode: str) -> None:
@@ -525,6 +549,71 @@ def render_question_prefill_map_panels(
     plt.close(fig)
 
 
+def render_question_prefill_sink_bin_token_panels(
+    maps: np.ndarray,
+    display_layer_indices: list[int],
+    output_path: Path,
+    *,
+    figure_title: str,
+    question_bin_labels: list[str] | None = None,
+    token_labels: list[str] | None = None,
+) -> None:
+    maps = np.asarray(maps, dtype=np.float32)
+    if maps.ndim != 3 or maps.shape[0] < 1:
+        return
+
+    finite_values = maps[np.isfinite(maps)]
+    if finite_values.size < 1:
+        return
+    norm = build_emphasized_heatmap_norm(finite_values)
+
+    max_cols = 4
+    num_panels = maps.shape[0]
+    num_rows = (num_panels + max_cols - 1) // max_cols
+    num_cols = min(num_panels, max_cols)
+    panel_width = 5.0
+    panel_height = 3.8 if maps.shape[1] <= 12 else 4.8
+    fig, axes = plt.subplots(
+        num_rows, num_cols,
+        figsize=(panel_width * num_cols, panel_height * num_rows + 1.0),
+        squeeze=False,
+    )
+
+    if token_labels is None or len(token_labels) != maps.shape[2]:
+        token_labels = [f"tok{index}" for index in range(maps.shape[2])]
+
+    mappable = None
+    for panel_idx, (matrix, layer_idx) in enumerate(zip(maps, display_layer_indices)):
+        row_idx, col_idx = divmod(panel_idx, max_cols)
+        ax = axes[row_idx][col_idx]
+        mappable = scatter_square_heatmap(ax, matrix, norm=norm)
+        ax.set_title(f"Layer {int(layer_idx)}")
+        ax.set_xlabel("Token Offset in Sink Bin")
+        apply_token_ticks(ax, token_labels)
+        if question_bin_labels is not None and len(question_bin_labels) == matrix.shape[0]:
+            apply_question_ticks(ax, question_bin_labels)
+        else:
+            y_positions = np.linspace(0, matrix.shape[0] - 1, min(5, matrix.shape[0]))
+            ax.set_yticks(y_positions)
+            ax.set_yticklabels([f"{value:.2f}" for value in np.linspace(0.0, 1.0, len(y_positions))])
+        if col_idx == 0:
+            ax.set_ylabel("Question Token Bin")
+
+    for col_idx in range(num_panels % max_cols or max_cols, max_cols):
+        if num_rows > 1 or num_panels < max_cols:
+            last_row = num_rows - 1
+            if last_row < axes.shape[0] and col_idx < axes.shape[1]:
+                axes[last_row][col_idx].set_visible(False)
+
+    fig.suptitle(figure_title, y=0.98)
+    fig.subplots_adjust(left=0.05, right=0.88, top=0.90, bottom=0.14, wspace=0.30, hspace=0.75)
+    if mappable is not None:
+        cbar_ax = fig.add_axes([0.90, 0.14, 0.015, 0.76])
+        fig.colorbar(mappable, cax=cbar_ax, label="Mean Attention Score")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def resample_attention_map(matrix: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
     source = torch.as_tensor(matrix, dtype=torch.float32)[None, None]
     resized = F.interpolate(source, size=target_shape, mode="bilinear", align_corners=False)
@@ -652,50 +741,81 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
         plt.close(fig)
 
     map_payload = question_prefill_map_payload(payload)
+    example_label = make_example_label(payload, example_key)
     if map_payload is None:
         print(
             f"Skipping question-prefill map heatmaps for {example_key}: "
             "saved example payload does not contain question_prefill_attention_maps."
         )
+    else:
+        display_layer_indices = [int(index) for index in map_payload.get("display_layer_indices", [])]
+        frame_bin_slices = [
+            [int(start), int(end)]
+            for start, end in map_payload.get("frame_bin_slices", [])
+        ]
+        frame_bin_labels = [str(label) for label in map_payload.get("frame_bin_labels", [])]
+        question_bin_labels = [str(label) for label in map_payload.get("question_bin_labels", [])]
+
+        frame_frame_maps = to_numpy_array(map_payload.get("frame_frame_maps"))
+        if frame_frame_maps is not None:
+            render_question_prefill_map_panels(
+                frame_frame_maps,
+                display_layer_indices,
+                example_dir / "question_prefill_frame_frame_maps.png",
+                figure_title=f"Question Prefill Frame↔Frame Maps: {example_label}",
+                x_label="Frame Index",
+                y_label="Frame Index",
+                mode="frame_frame",
+                frame_bin_slices=frame_bin_slices,
+                frame_bin_labels=frame_bin_labels,
+            )
+
+        question_frame_maps = to_numpy_array(map_payload.get("question_frame_maps"))
+        if question_frame_maps is not None:
+            render_question_prefill_map_panels(
+                question_frame_maps,
+                display_layer_indices,
+                example_dir / "question_prefill_question_frame_maps.png",
+                figure_title=f"Question Prefill Question→Frame Maps: {example_label}",
+                x_label="Frame Index",
+                y_label="Question Token Bin",
+                mode="question_frame",
+                frame_bin_slices=frame_bin_slices,
+                frame_bin_labels=frame_bin_labels,
+                question_bin_labels=question_bin_labels,
+            )
+
+    sink_payload = question_prefill_sink_bin_token_payload(payload)
+    if sink_payload is None:
+        print(
+            f"Skipping question-prefill sink-bin token heatmap for {example_key}: "
+            "saved example payload does not contain question_prefill_sink_bin_token_attention."
+        )
         return
 
-    display_layer_indices = [int(index) for index in map_payload.get("display_layer_indices", [])]
-    frame_bin_slices = [
-        [int(start), int(end)]
-        for start, end in map_payload.get("frame_bin_slices", [])
-    ]
-    frame_bin_labels = [str(label) for label in map_payload.get("frame_bin_labels", [])]
-    question_bin_labels = [str(label) for label in map_payload.get("question_bin_labels", [])]
-    example_label = make_example_label(payload, example_key)
-
-    frame_frame_maps = to_numpy_array(map_payload.get("frame_frame_maps"))
-    if frame_frame_maps is not None:
-        render_question_prefill_map_panels(
-            frame_frame_maps,
-            display_layer_indices,
-            example_dir / "question_prefill_frame_frame_maps.png",
-            figure_title=f"Question Prefill Frame↔Frame Maps: {example_label}",
-            x_label="Frame Index",
-            y_label="Frame Index",
-            mode="frame_frame",
-            frame_bin_slices=frame_bin_slices,
-            frame_bin_labels=frame_bin_labels,
-        )
-
-    question_frame_maps = to_numpy_array(map_payload.get("question_frame_maps"))
-    if question_frame_maps is not None:
-        render_question_prefill_map_panels(
-            question_frame_maps,
-            display_layer_indices,
-            example_dir / "question_prefill_question_frame_maps.png",
-            figure_title=f"Question Prefill Question→Frame Maps: {example_label}",
-            x_label="Frame Index",
-            y_label="Question Token Bin",
-            mode="question_frame",
-            frame_bin_slices=frame_bin_slices,
-            frame_bin_labels=frame_bin_labels,
-            question_bin_labels=question_bin_labels,
-        )
+    sink_maps = to_numpy_array(sink_payload.get("maps"))
+    if sink_maps is None:
+        return
+    sink_display_layer_indices = [int(index) for index in sink_payload.get("display_layer_indices", [])]
+    if len(sink_display_layer_indices) != sink_maps.shape[0]:
+        sink_display_layer_indices = list(range(sink_maps.shape[0]))
+    sink_question_bin_labels = [str(label) for label in sink_payload.get("question_bin_labels", [])]
+    sink_token_labels = [str(label) for label in sink_payload.get("token_labels", [])]
+    sink_bin_index = sink_payload.get("sink_bin_index", "n/a")
+    sink_frame_label = sink_payload.get("sink_frame_label", "n/a")
+    sink_token_start = sink_payload.get("sink_token_start", "n/a")
+    sink_token_end = sink_payload.get("sink_token_end", "n/a")
+    render_question_prefill_sink_bin_token_panels(
+        sink_maps,
+        sink_display_layer_indices,
+        example_dir / "question_prefill_sink_bin_token_attention.png",
+        figure_title=(
+            f"Question Prefill Sink-Bin Token Attention: {example_label} "
+            f"(bin={sink_bin_index}, frame={sink_frame_label}, tokens={sink_token_start}:{sink_token_end})"
+        ),
+        question_bin_labels=sink_question_bin_labels,
+        token_labels=sink_token_labels,
+    )
 
 
 def load_example_payloads(examples_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
