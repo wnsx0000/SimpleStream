@@ -318,7 +318,11 @@ top-4 frames, then reorders those four frames temporally before Qwen3-VL
 inference.
 
 Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
-`qwen3vl_siglip_top4_results_*.json`. `summary.json` reports subset/task
+`qwen3vl_siglip_top4_results_*.json`. Each record includes
+`analysis_frame_indices`, `analysis_frame_scores`,
+`selected_frame_indices_by_similarity`, `selected_frame_indices_for_inference`,
+`selected_frame_relative_positions`, and
+`selected_frame_mean_relative_position`. `summary.json` reports subset/task
 accuracy, split-level official averages and pooled accuracy, plus both
 `Official Total Avg.` and `Pooled Overall Acc.` for the full run.
 
@@ -332,7 +336,7 @@ siglip top-4 full-candidate test.
 
 ```bash
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -343,6 +347,20 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py
     --fps 1.0 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
     > "./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}.log" 2>&1 &
+```
+
+Generate plots from a saved SigLIP top-4 result directory. The script reads
+`results_incremental.jsonl`, counts the relative positions of the 4 selected
+frames within the sampled video (using `selected_frame_relative_positions`;
+falls back to recomputing from `selected_frame_indices_for_inference` and
+`num_sampled_frames` for older runs), and writes
+`plots/siglip_top4_selected_position.png` with the same per-subset / split-avg
+/ total-avg layout as the attention top-4 plot. The HLD backward subset is
+excluded.
+
+```bash
+python analysis/plot_siglip_top4_selection.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_20260416_141554_always_recent4
 ```
 </details>
 
