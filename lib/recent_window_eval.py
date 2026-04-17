@@ -398,6 +398,7 @@ def decode_video_to_chunks_qwen(
     recent_frames_only: int | None = None,
     video_start: float | None = None,
     video_end: float | None = None,
+    max_frames: int | None = None,
 ) -> tuple[list[EvalChunk], str]:
     use_exact_recent = os.environ.get("QWEN_EXACT_RECENT_DECODE", "").strip().lower() in {
         "1",
@@ -424,6 +425,8 @@ def decode_video_to_chunks_qwen(
         video_req["video_start"] = max(0.0, float(video_start))
     if video_end is not None:
         video_req["video_end"] = max(0.0, float(video_end))
+    if max_frames is not None:
+        video_req["max_frames"] = int(max_frames)
 
     if use_exact_recent:
         if recent_frames_only is None or int(recent_frames_only) < 1:

@@ -1,9 +1,10 @@
 """
 OVO-Bench SigLIP top-4 frame evaluation for Qwen3-VL.
 
-This script scores a candidate frame subset with SigLIP cosine similarity
-against the question, keeps the top-4 frames, reorders them temporally,
-and runs QA using Qwen3-VL.
+This script scores every decoded fps-sampled frame with SigLIP cosine
+similarity against the question, keeps the top-4 frames, reorders them
+temporally, and runs QA using Qwen3-VL. Video decoding follows qwen_vl_utils
+sampling and caps decoded frames at 768.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ from lib.recent_window_eval import (
     decode_video_to_chunks_qwen,
     load_jsonl_results,
     score_ovo_br,
-    select_attention_frame_indices,
 )
 from lib.recent_window_eval_qwen3 import RecentWindowQAModel
 from main_experiments.eval_qwen3vl_ovo_saliency_common import (
@@ -54,6 +54,9 @@ EXCLUDED_BACKWARD_TASKS = frozenset({"HLD"})
 EVAL_BACKWARD_TASKS = [task for task in BACKWARD_TASKS if task not in EXCLUDED_BACKWARD_TASKS]
 EVAL_TASK_SET = frozenset([*EVAL_BACKWARD_TASKS, *REAL_TIME_TASKS])
 TOP_K_FRAMES = 4
+DECODE_MAX_FRAMES = 768
+CANDIDATE_FRAME_POLICY = "all_decoded_frames"
+ANALYSIS_SAMPLING_STRATEGY = "all_decoded_frames_qwen_cap768"
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
@@ -195,6 +198,7 @@ def decode_full_video_to_chunks(
             chunk_duration=chunk_duration,
             fps=fps,
             recent_frames_only=None,
+            max_frames=DECODE_MAX_FRAMES,
         )
     finally:
         if saved_exact_recent is not None:
@@ -328,7 +332,6 @@ def evaluate_siglip_top4_backward_realtime(
     chunk_duration: float,
     fps: float,
     recent_frames_only: int,
-    max_analysis_frames: int,
 ) -> dict[str, Any]:
     video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
     if not os.path.exists(video_path):
@@ -350,11 +353,8 @@ def evaluate_siglip_top4_backward_realtime(
     num_sampled_frames = len(frames)
     del chunks
 
-    analysis_frame_indices, analysis_sampling_strategy = select_attention_frame_indices(
-        total_frames=num_sampled_frames,
-        recent_indices=recent_indices,
-        max_analysis_frames=max_analysis_frames,
-    )
+    analysis_frame_indices = list(range(num_sampled_frames))
+    analysis_sampling_strategy = ANALYSIS_SAMPLING_STRATEGY
     if not analysis_frame_indices:
         raise ValueError(f"No analysis frames selected for video: {video_path}")
 
@@ -459,10 +459,10 @@ def main() -> None:
     parser.add_argument(
         "--max_analysis_frames",
         "--max_frames",
-        dest="max_analysis_frames",
+        dest="_deprecated_max_analysis_frames",
         type=int,
-        default=32,
-        help="Maximum number of candidate frames scored by SigLIP before selecting top-4 for inference.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--chunk_duration", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=1.0)
@@ -484,8 +484,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.max_analysis_frames < 1:
-        raise ValueError("--max_analysis_frames must be >= 1")
     if args.max_samples_per_split is not None and args.max_samples_per_split < 1:
         raise ValueError("--max_samples_per_split must be >= 1 when provided.")
     if args.max_samples_per_subset is not None and args.max_samples_per_subset < 1:
@@ -533,7 +531,8 @@ def main() -> None:
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
         f"Window: recent_frames_only={args.recent_frames_only}, "
-        f"max_analysis_frames={args.max_analysis_frames}, "
+        f"decode_max_frames={DECODE_MAX_FRAMES}, "
+        f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
         f"top_k={TOP_K_FRAMES}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
     )
@@ -593,7 +592,6 @@ def main() -> None:
                         chunk_duration=args.chunk_duration,
                         fps=args.fps,
                         recent_frames_only=args.recent_frames_only,
-                        max_analysis_frames=args.max_analysis_frames,
                     )
                 except Exception as exc:
                     result = build_error_record(anno, split_name, args.chunked_dir, exc)
@@ -621,7 +619,8 @@ def main() -> None:
             "result_dir": args.result_dir,
             "analysis_scope": args.analysis_scope,
             "recent_frames_only": args.recent_frames_only,
-            "max_analysis_frames": args.max_analysis_frames,
+            "decode_max_frames": DECODE_MAX_FRAMES,
+            "candidate_frame_policy": CANDIDATE_FRAME_POLICY,
             "top_k": TOP_K_FRAMES,
             "chunk_duration": args.chunk_duration,
             "fps": args.fps,

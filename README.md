@@ -170,7 +170,7 @@ python scoring/score_ovo_bench.py \
 - qwen3-vl-8B reproducing: ovo_qwen3vl_recent4
 - test1-1 (SigLIP cosine similarity mean percentile): ovo_qwen3vl_siglip_subset20_20260415_151005
 - test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260415_185231
-- test2 (SigLIP top-4 frame inference with `uniform_with_recent_anchor` candidates): ovo_qwen3vl_siglip_top4_all_20260415_205218
+- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): ovo_qwen3vl_siglip_top4_all_decoded_cap768_<RUN_TAG>
 
 </details>
 
@@ -301,11 +301,13 @@ python analysis/plot_siglip_similarity.py \
 
 Runs OVO-Bench backward/realtime evaluation with SigLIP-guided frame selection.
 The HLD backward-tracing subset is excluded.
-For each sample, the script first builds a candidate frame pool from the full
-decoded video (up to `--max_analysis_frames` frames using the same
-`uniform_with_recent_anchor` policy as Test 1), computes cosine similarity
-between each candidate frame and the question, selects the top-4 frames, then
-reorders those four frames temporally before Qwen3-VL inference.
+For each sample, the script decodes the full video at `--fps 1.0` with the
+same `qwen_vl_utils` sampling policy used by the Qwen-VL pipeline. Decoding is
+explicitly capped at 768 frames; videos longer than this are uniformly sampled
+across the full time range by `qwen_vl_utils`. The script computes SigLIP
+cosine similarity between every decoded frame and the question, selects the
+top-4 frames, then reorders those four frames temporally before Qwen3-VL
+inference.
 
 Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
 `qwen3vl_siglip_top4_results_*.json`. `summary.json` reports subset/task
@@ -313,24 +315,26 @@ accuracy, split-level official averages and pooled accuracy, plus both
 `Official Total Avg.` and `Pooled Overall Acc.` for the full run.
 
 Use `--max_samples_per_subset 50` to sample up to 50 examples independently
-from each OVO subset/task within those splits. `--max_frames` is kept as an
-alias of `--max_analysis_frames` for backward compatibility.
+from each OVO subset/task within those splits. `--max_analysis_frames` and
+`--max_frames` are accepted only as deprecated no-op arguments for backward
+compatibility; Test 2 always scores all decoded frames after the qwen 768-frame
+decode cap.
 
-siglip top-4 subset20 test.
+siglip top-4 full-candidate test.
 
 ```bash
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
 CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S)_always_recent4 \
+    --result_dir "main_experiments/results/ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}" \
     --analysis_scope full \
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_$(date +%Y%m%d_%H%M%S)_always_recent4.log 2>&1 &
+    > "./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}.log" 2>&1 &
 ```
 </details>
 
