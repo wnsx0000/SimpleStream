@@ -6,7 +6,7 @@ __pycache__/
 # Local datasets and generated artifacts
 data/
 # results/
-main_experiments/results/
+# main_experiments/results/
 efficiency/result/
 efficiency/video/
 

@@ -439,7 +439,7 @@ subset is excluded.
 
 ```bash
 python analysis/plot_attn_top4_selection.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_20260416_214018
+    --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer18_20260416_214018
 ```
 </details>
 

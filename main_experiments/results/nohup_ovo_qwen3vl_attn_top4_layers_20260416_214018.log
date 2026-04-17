@@ -1,0 +1,27 @@
+nohup: ignoring input
+Batch tag: 20260416_214018
+Layers: 0 18 32 35
+CUDA_VISIBLE_DEVICES=4,5,6,7
+Result root: main_experiments/results
+
+============================================================
+Starting layer 0
+Result dir: main_experiments/results/ovo_qwen3vl_attn_top4_layer0_20260416_214018
+Log: main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer0_20260416_214018.log
+============================================================
+Completed layer 0
+
+============================================================
+Starting layer 18
+Result dir: main_experiments/results/ovo_qwen3vl_attn_top4_layer18_20260416_214018
+Log: main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer18_20260416_214018.log
+============================================================
+Completed layer 18
+
+============================================================
+Starting layer 32
+Result dir: main_experiments/results/ovo_qwen3vl_attn_top4_layer32_20260416_214018
+Log: main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer32_20260416_214018.log
+============================================================
+main_experiments/run_qwen3vl_ovo_attn_top4_layers.sh: line 82: 1934781 Killed                  HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}" HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}" "${cmd[@]}" > "${log_path}" 2>&1
+Layer 32 failed with exit code 137. See main_experiments/results/nohup_ovo_qwen3vl_attn_top4_layer32_20260416_214018.log
