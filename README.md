@@ -178,7 +178,9 @@ python scoring/score_ovo_bench.py \
 - test3 (attention score based selection, layer 18):
 - test3 (attention score based selection, layer 32):
 - test3 (attention score based selection, layer 35):
-- test4 (Visual-RAG: SigLIP top-5 non-recent frames + recent 4 frames, qwen cap 768):
+- test4 (Visual-RAG: SigLIP top-4 non-recent frames + recent 4 frames, qwen cap 768): ovo_qwen3vl_vrag_top4_20260417_170754_flash
+- test4 (Visual-RAG: SigLIP top- non-recent frames + recent 4 frames, qwen cap 768): ovo_qwen3vl_vrag_top8_20260417_170845_flash
+- test5 (V-RAG + Chunked attention: retrieved frames split by `chunk_size`, recent frames = 1 chunk, cross-chunk attention blocked in every layer): -
 
 </details>
 
@@ -611,6 +613,118 @@ bar/line summaries are produced.
 ```bash
 python analysis/plot_vrag_attention_heatmap.py \
     --result-dir main_experiments/results/ovo_qwen3vl_vrag_top5_20260417_120000
+```
+</details>
+
+<details>
+<summary><b>Test 5</b></summary>
+
+Extends Test 4 (V-RAG top-K) with **chunked attention** over frame tokens.
+Frame selection is identical to Test 4: decode the full video at `--fps 1.0`
+with the qwen_vl_utils sampling policy (capped by `--decode_max_frames`),
+retrieve the top-K most similar non-recent frames by SigLIP cosine similarity
+against the question, then union them with the recent frames and sort the
+union temporally. The HLD backward-tracing subset is excluded.
+
+The difference from Test 4 is the attention pattern used during Qwen3-VL
+prefill: retrieved historical frames are grouped in temporal order into
+chunks of `--chunk_size` frames, and the recent frames form a single separate
+chunk (whose size always equals `--recent_frames_only`, independent of
+`--chunk_size`). Attention between frame tokens in different chunks is
+blocked in every decoder layer, so retrieved frames cannot leak information
+into recent-frame representations (and vice versa). Attention inside a chunk
+remains causal; non-frame tokens (system prompt, question, generation tokens)
+are unaffected and can attend causally to every preceding token.
+
+Example with `--recent_frames_only 4 --top_k_historical 4`:
+- `--chunk_size 4` &rarr; `[4 retrieved] | [4 recent]` (2 chunks)
+- `--chunk_size 2` &rarr; `[2 retrieved] | [2 retrieved] | [4 recent]` (3 chunks)
+- `--chunk_size 1` &rarr; `[r0] | [r1] | [r2] | [r3] | [4 recent]` (5 chunks)
+
+**Implementation.** The chunked restriction is implemented as a 4D additive
+float attention mask of shape `[1, 1, seq_len, seq_len]` built from
+`frame_token_spans`. The mask is injected only during prefill by a context
+manager that monkey-patches
+`transformers.models.qwen3_vl.modeling_qwen3_vl.create_causal_mask`;
+`create_causal_mask` early-returns when handed a 4D mask
+(`transformers/masking_utils.py:720-722`), so the mask is consumed as-is by
+every decoder layer. Decode steps (query length 1, with populated KV cache)
+fall through to the original function for standard causal behaviour.
+`--attn_implementation` defaults to `sdpa` (fastest backend that supports
+arbitrary 4D float masks); `eager` is also supported.
+**`flash_attention_2` is not supported** (does not accept arbitrary 4D
+masks) and Test 5 fails fast if selected.
+
+Outputs mirror Test 4 (`results_incremental.jsonl`, `summary.json`, and
+`qwen3vl_vrag_top{K}_chunk{C}_results_*.json`) and additionally include
+`chunk_size`, `chunk_assignment_by_frame_index`, `retrieved_chunk_sizes`,
+`recent_chunk_id`, `num_retrieved_chunks`, and `num_chunks_total` per
+record. Each saved attention example also carries a `chunked_attention`
+dict with the same metadata, so `analysis/plot_vrag_attention_heatmap.py`
+can be reused verbatim (the block-diagonal chunk pattern shows up directly
+in the question-prefill frame-frame heatmap).
+
+V-RAG top-K + chunked attention test. `TOP_K` controls `--top_k_historical`
+and `CHUNK_SIZE` controls `--chunk_size`; both are interpolated into the
+result directory and log filename.
+
+```bash
+TOP_K=4
+CHUNK_SIZE=2
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --max_samples_per_subset 50 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+```
+
+Smoke run (1 sample per split):
+
+```bash
+TOP_K=4
+CHUNK_SIZE=2
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=0 python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --analysis_scope smoke \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --max_samples_per_split 1 \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}_smoke" \
+    --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto
+```
+
+Render per-example attention heatmaps (reusing the Test 4 plotter):
+
+```bash
+python analysis/plot_vrag_attention_heatmap.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_vrag_top4_chunk2_20260417_200000
 ```
 </details>
 
