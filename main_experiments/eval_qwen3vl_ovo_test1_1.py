@@ -28,11 +28,16 @@ def main() -> None:
         include_save_raw_attn_examples=False,
     )
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
+    parser.add_argument(
+        "--siglip_device",
+        default="auto",
+        help="SigLIP device. 'auto' selects the visible CUDA GPU with the most free memory; use cuda:N or cpu to override.",
+    )
     args = parser.parse_args()
 
     analyzer = build_siglip_frame_saliency_analyzer(
         siglip_model_name=args.siglip_model_name,
-        device="auto",
+        device=args.siglip_device,
     )
     config = SaliencyExperimentConfig(
         run_label="OVO-Bench Recent4 Saliency Analysis (SigLIP)",
@@ -55,6 +60,7 @@ def main() -> None:
             "script": "eval_qwen3vl_ovo_test1_1.py",
             "mode": "siglip_similarity",
             "siglip_model_name": args.siglip_model_name,
+            "siglip_device": args.siglip_device,
         },
     )
     run_saliency_experiment(analyzer=analyzer, config=config)

@@ -33,6 +33,7 @@ from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
 from lib.frame_saliency_qwen3 import (
     SiglipFrameEncoder,
     cosine_scores_against_query,
+    format_siglip_device_for_log,
     flatten_chunks,
 )
 from lib.recent_window_eval import (
@@ -481,6 +482,11 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max_qa_tokens", type=int, default=256)
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
+    parser.add_argument(
+        "--siglip_device",
+        default="auto",
+        help="SigLIP device. 'auto' selects the visible CUDA GPU with the most free memory; use cuda:N or cpu to override.",
+    )
     parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--max_samples_per_subset", type=int, default=None)
@@ -567,8 +573,9 @@ def main() -> None:
     )
     siglip_encoder = SiglipFrameEncoder(
         model_name=args.siglip_model_name,
-        device=accelerator.device,
+        device=args.siglip_device,
     )
+    accelerator.print(f"SigLIP device: {format_siglip_device_for_log(siglip_encoder.device)}")
 
     with accelerator.split_between_processes(backward_anno) as local_backward:
         local_backward = list(local_backward)
@@ -627,6 +634,8 @@ def main() -> None:
             "model_label": MODEL_LABEL,
             "model_path": args.model_path,
             "siglip_model_name": args.siglip_model_name,
+            "siglip_device": args.siglip_device,
+            "resolved_siglip_device": str(siglip_encoder.device),
             "anno_path": args.anno_path,
             "chunked_dir": args.chunked_dir,
             "result_dir": args.result_dir,

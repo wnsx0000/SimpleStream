@@ -5,7 +5,8 @@ This script implements the Visual-RAG (V-RAG) ablation from SimpleStream: the
 recent N frames are always kept, and the top-5 *non-recent* frames are
 retrieved by SigLIP cosine similarity against the question and appended to
 the recent-frame input before Qwen3-VL generates an answer. Video decoding
-follows qwen_vl_utils sampling and caps decoded frames at 768.
+follows qwen_vl_utils sampling and caps decoded frames at
+``--decode_max_frames`` (default 768).
 
 When ``--save_example_matrices`` > 0, the script additionally captures
 Qwen3-VL question-prefill self-attention over the combined (recent + top-5
@@ -45,6 +46,7 @@ from lib.frame_saliency_qwen3 import (
     SiglipFrameEncoder,
     build_question_prefill_attention_map_metadata,
     cosine_scores_against_query,
+    format_siglip_device_for_log,
     flatten_chunks,
     frame_token_counts_from_grid,
     question_prefill_layer_indices,
@@ -69,11 +71,15 @@ EVAL_TASK_SET = frozenset([*EVAL_BACKWARD_TASKS, *REAL_TIME_TASKS])
 DEFAULT_TOP_K_HISTORICAL_FRAMES = 5
 DECODE_MAX_FRAMES = 768
 CANDIDATE_FRAME_POLICY = "non_recent_frames"
-ANALYSIS_SAMPLING_STRATEGY = "non_recent_frames_qwen_cap768"
+ANALYSIS_SAMPLING_STRATEGY_PREFIX = "non_recent_frames_qwen_cap"
 
 
 def format_model_label(top_k_historical: int) -> str:
     return f"Qwen3-VL-V-RAG-Top{int(top_k_historical)}"
+
+
+def format_analysis_sampling_strategy(decode_max_frames: int) -> str:
+    return f"{ANALYSIS_SAMPLING_STRATEGY_PREFIX}{int(decode_max_frames)}"
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
@@ -207,11 +213,18 @@ def write_json(path: str, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
+def release_cuda_cache() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def decode_full_video_to_chunks(
     *,
     video_path: str,
     chunk_duration: float,
     fps: float,
+    decode_max_frames: int,
 ) -> tuple[list[Any], str]:
     saved_exact_recent = os.environ.pop("QWEN_EXACT_RECENT_DECODE", None)
     try:
@@ -220,7 +233,7 @@ def decode_full_video_to_chunks(
             chunk_duration=chunk_duration,
             fps=fps,
             recent_frames_only=None,
-            max_frames=DECODE_MAX_FRAMES,
+            max_frames=int(decode_max_frames),
         )
     finally:
         if saved_exact_recent is not None:
@@ -354,49 +367,65 @@ def capture_question_prefill_attention_maps(
     if not combined_frames or not question_text:
         return None
 
-    cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
-    frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, qa.merge_size)
+    cached_embeds = None
+    cached_grid_thw = None
+    question_only_inputs = None
+    collector = None
+    prefill_output = None
+    prefill_scores = None
 
-    text_layers = qa._get_text_layers()
-    num_text_layers = len(text_layers)
-    display_layer_indices = question_prefill_layer_indices(num_text_layers)
+    try:
+        cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
+        frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, qa.merge_size)
 
-    question_only_inputs = qa._build_cached_multimodal_inputs(
-        cached_embeds=cached_embeds,
-        cached_grid_thw=cached_grid_thw,
-        frame_token_counts=frame_token_counts,
-        question=question_text,
-    )
-    map_metadata = build_question_prefill_attention_map_metadata(
-        frame_token_spans=question_only_inputs["frame_token_spans"],
-        query_positions=question_only_inputs["question_token_positions"],
-        attention_frame_indices=combined_frame_indices,
-    )
-    collector = LayerwiseFrameAttentionCollector(
-        frame_token_spans=question_only_inputs["frame_token_spans"],
-        query_positions=question_only_inputs["question_token_positions"],
-        num_layers=num_text_layers,
-        save_raw=False,
-        map_layer_indices=display_layer_indices,
-        question_prefill_map_metadata=map_metadata,
-    )
-    _ = qa._run_with_collector(
-        collector,
-        use_cache=False,
-        input_ids=None,
-        inputs_embeds=question_only_inputs["inputs_embeds"],
-        attention_mask=question_only_inputs["attention_mask"],
-        position_ids=question_only_inputs["position_ids"],
-    )
-    attention_map_payload = collector.export_question_prefill_attention_maps(display_layer_indices)
-    prefill_scores = collector.as_tensor()
-    display_scores = prefill_scores[display_layer_indices]
+        text_layers = qa._get_text_layers()
+        num_text_layers = len(text_layers)
+        display_layer_indices = question_prefill_layer_indices(num_text_layers)
 
-    return {
-        "question_prefill_attention_maps": attention_map_payload,
-        "question_prefill_attention_scores": display_scores.detach().cpu(),
-        "question_prefill_display_layer_indices": [int(i) for i in display_layer_indices],
-    }
+        question_only_inputs = qa._build_cached_multimodal_inputs(
+            cached_embeds=cached_embeds,
+            cached_grid_thw=cached_grid_thw,
+            frame_token_counts=frame_token_counts,
+            question=question_text,
+        )
+        map_metadata = build_question_prefill_attention_map_metadata(
+            frame_token_spans=question_only_inputs["frame_token_spans"],
+            query_positions=question_only_inputs["question_token_positions"],
+            attention_frame_indices=combined_frame_indices,
+        )
+        collector = LayerwiseFrameAttentionCollector(
+            frame_token_spans=question_only_inputs["frame_token_spans"],
+            query_positions=question_only_inputs["question_token_positions"],
+            num_layers=num_text_layers,
+            save_raw=False,
+            map_layer_indices=display_layer_indices,
+            question_prefill_map_metadata=map_metadata,
+        )
+        prefill_output = qa._run_with_collector(
+            collector,
+            use_cache=False,
+            input_ids=None,
+            inputs_embeds=question_only_inputs["inputs_embeds"],
+            attention_mask=question_only_inputs["attention_mask"],
+            position_ids=question_only_inputs["position_ids"],
+        )
+        del prefill_output
+        prefill_output = None
+
+        attention_map_payload = collector.export_question_prefill_attention_maps(display_layer_indices)
+        prefill_scores = collector.as_tensor()
+        display_scores = prefill_scores[display_layer_indices].detach().cpu()
+
+        return {
+            "question_prefill_attention_maps": attention_map_payload,
+            "question_prefill_attention_scores": display_scores,
+            "question_prefill_display_layer_indices": [int(i) for i in display_layer_indices],
+        }
+    finally:
+        if isinstance(question_only_inputs, dict):
+            question_only_inputs.clear()
+        del cached_embeds, cached_grid_thw, question_only_inputs, collector, prefill_output, prefill_scores
+        release_cuda_cache()
 
 
 def save_example_payload(
@@ -451,6 +480,7 @@ def evaluate_vrag_top5_backward_realtime(
     siglip_encoder: SiglipFrameEncoder,
     chunk_duration: float,
     fps: float,
+    decode_max_frames: int,
     recent_frames_only: int,
     top_k_historical: int,
     examples_dir: Path | None = None,
@@ -468,6 +498,7 @@ def evaluate_vrag_top5_backward_realtime(
         video_path=video_path,
         chunk_duration=chunk_duration,
         fps=fps,
+        decode_max_frames=decode_max_frames,
     )
     if not chunks:
         raise ValueError(f"No chunks decoded from video: {video_path}")
@@ -519,6 +550,7 @@ def evaluate_vrag_top5_backward_realtime(
         raise ValueError(f"No frames selected for inference: {video_path}")
 
     combined_frames = [frames[frame_index] for frame_index in combined_frame_indices]
+    del frames
 
     relative_position_denom = max(1, num_sampled_frames - 1)
     combined_frame_relative_positions = [
@@ -534,10 +566,12 @@ def evaluate_vrag_top5_backward_realtime(
     t0 = time.perf_counter()
     response = qa.generate_from_frames(combined_frames, prompt)
     generate_time = time.perf_counter() - t0
+    release_cuda_cache()
 
     example_path: Path | None = None
     example_save_error: str | None = None
     if save_example and examples_dir is not None:
+        attention_payload = None
         try:
             attention_payload = capture_question_prefill_attention_maps(
                 qa=qa,
@@ -566,9 +600,9 @@ def evaluate_vrag_top5_backward_realtime(
                 )
         except Exception as exc:
             example_save_error = f"{type(exc).__name__}: {exc}"
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        finally:
+            del attention_payload
+            release_cuda_cache()
 
     selected_historical_frame_rows = [
         {
@@ -605,7 +639,7 @@ def evaluate_vrag_top5_backward_realtime(
         "num_historical_candidate_frames": len(historical_candidate_indices),
         "historical_candidate_frame_indices": [int(i) for i in historical_candidate_indices],
         "historical_candidate_frame_scores": [float(s) for s in historical_candidate_scores],
-        "analysis_sampling_strategy": ANALYSIS_SAMPLING_STRATEGY,
+        "analysis_sampling_strategy": format_analysis_sampling_strategy(decode_max_frames),
         "selected_historical_frame_indices_by_similarity": selected_historical_frame_indices_by_similarity,
         "selected_historical_frame_indices": [int(i) for i in selected_historical_frame_indices],
         "selected_historical_frames": selected_historical_frame_rows,
@@ -657,8 +691,22 @@ def main() -> None:
     )
     parser.add_argument("--chunk_duration", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument(
+        "--decode_max_frames",
+        type=int,
+        default=DECODE_MAX_FRAMES,
+        help=(
+            "Maximum number of frames decoded for V-RAG retrieval. "
+            "SigLIP similarity is computed over the decoded non-recent frames. Default: 768."
+        ),
+    )
     parser.add_argument("--max_qa_tokens", type=int, default=256)
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
+    parser.add_argument(
+        "--siglip_device",
+        default="auto",
+        help="SigLIP device. 'auto' selects the visible CUDA GPU with the most free memory; use cuda:N or cpu to override.",
+    )
     parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--max_samples_per_subset", type=int, default=None)
@@ -707,6 +755,8 @@ def main() -> None:
         raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
     if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
         raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
+    if args.decode_max_frames < 1:
+        raise ValueError("--decode_max_frames must be >= 1.")
     if args.top_k_historical < 0:
         raise ValueError("--top_k_historical must be >= 0.")
 
@@ -752,7 +802,7 @@ def main() -> None:
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
         f"Window: recent_frames_only={args.recent_frames_only}, "
-        f"decode_max_frames={DECODE_MAX_FRAMES}, "
+        f"decode_max_frames={args.decode_max_frames}, "
         f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
         f"top_k_historical={int(args.top_k_historical)}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
@@ -774,8 +824,10 @@ def main() -> None:
         max_new_tokens=args.max_qa_tokens,
         attn_implementation=args.attn_implementation,
         siglip_model_name=args.siglip_model_name,
+        siglip_device=args.siglip_device,
     )
     siglip_encoder = evaluator.get_siglip_encoder()
+    accelerator.print(f"SigLIP device: {format_siglip_device_for_log(siglip_encoder.device)}")
 
     with accelerator.split_between_processes(backward_anno) as local_backward:
         local_backward = list(local_backward)
@@ -827,6 +879,7 @@ def main() -> None:
                         siglip_encoder=siglip_encoder,
                         chunk_duration=args.chunk_duration,
                         fps=args.fps,
+                        decode_max_frames=args.decode_max_frames,
                         recent_frames_only=args.recent_frames_only,
                         top_k_historical=args.top_k_historical,
                         examples_dir=examples_dir,
@@ -836,9 +889,7 @@ def main() -> None:
                         saved_examples_by_task[task_name] += 1
                 except Exception as exc:
                     result = build_error_record(anno, split_name, args.chunked_dir, exc)
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    release_cuda_cache()
 
                 result_sink.append(result)
                 done_keys.add(key)
@@ -855,12 +906,14 @@ def main() -> None:
             "model_label": model_label,
             "model_path": args.model_path,
             "siglip_model_name": args.siglip_model_name,
+            "siglip_device": args.siglip_device,
+            "resolved_siglip_device": str(siglip_encoder.device),
             "anno_path": args.anno_path,
             "chunked_dir": args.chunked_dir,
             "result_dir": args.result_dir,
             "analysis_scope": args.analysis_scope,
             "recent_frames_only": args.recent_frames_only,
-            "decode_max_frames": DECODE_MAX_FRAMES,
+            "decode_max_frames": args.decode_max_frames,
             "candidate_frame_policy": CANDIDATE_FRAME_POLICY,
             "top_k_historical": int(args.top_k_historical),
             "chunk_duration": args.chunk_duration,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -672,12 +673,94 @@ class LayerwiseFrameAttentionCollector:
         }
 
 
+def _is_auto_siglip_device(device: str | torch.device | None) -> bool:
+    if device is None:
+        return True
+    return str(device).strip().lower() in {"auto", "most_free", "most_free_cuda"}
+
+
+def _visible_cuda_device_label(logical_index: int) -> str:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not visible_devices:
+        return str(logical_index)
+    visible_labels = [item.strip() for item in visible_devices.split(",") if item.strip()]
+    if 0 <= logical_index < len(visible_labels):
+        return visible_labels[logical_index]
+    return str(logical_index)
+
+
+def _cuda_gib(num_bytes: int) -> float:
+    return float(num_bytes) / float(1024**3)
+
+
+def select_most_free_cuda_device() -> torch.device:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        raise RuntimeError("No CUDA device is available.")
+
+    best_index: int | None = None
+    best_free_bytes = -1
+    for index in range(torch.cuda.device_count()):
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(index)
+        except Exception as exc:
+            warnings.warn(
+                f"Unable to read free CUDA memory for cuda:{index}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        if int(free_bytes) > best_free_bytes:
+            best_free_bytes = int(free_bytes)
+            best_index = index
+
+    if best_index is None:
+        warnings.warn(
+            "Unable to compare CUDA free memory for SigLIP; falling back to cuda:0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        best_index = 0
+    return torch.device(f"cuda:{best_index}")
+
+
+def resolve_siglip_device(
+    device: str | torch.device | None = "auto",
+    fallback_device: str | torch.device | None = None,
+) -> torch.device:
+    if not _is_auto_siglip_device(device):
+        return torch.device(device)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return select_most_free_cuda_device()
+    if fallback_device is not None:
+        return torch.device(fallback_device)
+    return torch.device("cpu")
+
+
+def format_siglip_device_for_log(device: str | torch.device) -> str:
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        return str(resolved)
+
+    logical_index = resolved.index
+    if logical_index is None:
+        logical_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+    label = f"{resolved} (visible_id={_visible_cuda_device_label(logical_index)}"
+    if torch.cuda.is_available():
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(logical_index)
+            label += f", free={_cuda_gib(int(free_bytes)):.2f}GiB/{_cuda_gib(int(total_bytes)):.2f}GiB"
+        except Exception:
+            pass
+    return label + ")"
+
+
 class SiglipFrameEncoder:
-    def __init__(self, model_name: str, device: str | torch.device) -> None:
+    def __init__(self, model_name: str, device: str | torch.device = "auto") -> None:
         from transformers import AutoModel, AutoProcessor
 
         self.model_name = model_name
-        self.device = torch.device(device)
+        self.device = resolve_siglip_device(device)
         self.processor = AutoProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name)
         self.model.to(self.device)
@@ -737,16 +820,6 @@ class SiglipFrameEncoder:
         return text_feature
 
 
-def resolve_siglip_device(fallback_device: str | torch.device | None = None) -> torch.device:
-    if torch.cuda.device_count() > 1:
-        return torch.device(f"cuda:{torch.cuda.device_count() - 1}")
-    if fallback_device is not None:
-        return torch.device(fallback_device)
-    if torch.cuda.is_available():
-        return torch.device("cuda:0")
-    return torch.device("cpu")
-
-
 def build_analysis_subset(
     total_frames: int,
     recent_indices: list[int],
@@ -778,10 +851,9 @@ class SiglipOnlyRecent4FrameSaliencyAnalyzer:
 
     def get_siglip_encoder(self) -> SiglipFrameEncoder:
         if self._siglip_encoder is None:
-            fallback_device = None if str(self.device) == "auto" else self.device
             self._siglip_encoder = SiglipFrameEncoder(
                 self.siglip_model_name,
-                resolve_siglip_device(fallback_device=fallback_device),
+                self.device,
             )
         return self._siglip_encoder
 
@@ -876,6 +948,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         max_new_tokens: int = 256,
         attn_implementation: str = "eager",
         siglip_model_name: str = "google/siglip-so400m-patch14-384",
+        siglip_device: str | torch.device = "auto",
     ) -> None:
         super().__init__(
             model_name=model_name,
@@ -884,11 +957,15 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             attn_implementation=attn_implementation,
         )
         self.siglip_model_name = siglip_model_name
+        self.siglip_device = siglip_device
         self._siglip_encoder: SiglipFrameEncoder | None = None
 
     def get_siglip_encoder(self) -> SiglipFrameEncoder:
         if self._siglip_encoder is None:
-            siglip_device = resolve_siglip_device(fallback_device=self._get_visual_device())
+            siglip_device = resolve_siglip_device(
+                self.siglip_device,
+                fallback_device=self._get_visual_device(),
+            )
             self._siglip_encoder = SiglipFrameEncoder(self.siglip_model_name, siglip_device)
         return self._siglip_encoder
 

@@ -178,7 +178,7 @@ python scoring/score_ovo_bench.py \
 - test3 (attention score based selection, layer 18):
 - test3 (attention score based selection, layer 32):
 - test3 (attention score based selection, layer 35):
-- test4 (Visual-RAG: SigLIP top-5 non-recent frames + recent 4 frames, qwen cap 768): -
+- test4 (Visual-RAG: SigLIP top-5 non-recent frames + recent 4 frames, qwen cap 768):
 
 </details>
 
@@ -286,6 +286,10 @@ python analysis/plot_recent_frame_saliency.py \
 siglip similarity test.
 Decodes all frames at fps 1.0 (capped at 768 by default) and computes SigLIP
 cosine similarity against the question for every decoded frame.
+`--siglip_device auto` selects the visible CUDA device with the most free
+memory when SigLIP is initialized. `CUDA_VISIBLE_DEVICES` still bounds the
+candidate GPUs; pass `--siglip_device cuda:N` or `--siglip_device cpu` to
+override.
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_1.py \
@@ -298,6 +302,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test
     --chunk_duration 1.0 \
     --fps 1.0 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
     > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_subset20_all_frames_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
@@ -351,6 +356,7 @@ CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test2.py
     --chunk_duration 1.0 \
     --fps 1.0 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
     > "./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}.log" 2>&1 &
 ```
 
@@ -478,7 +484,8 @@ is set by `--top_k_historical` (default 5 to match the paper). The
 HLD backward-tracing subset is excluded.
 
 For each sample, the script decodes the full video at `--fps 1.0` with the
-same `qwen_vl_utils` sampling policy used by Test 2 (capped at 768 frames),
+same `qwen_vl_utils` sampling policy used by Test 2 (capped by
+`--decode_max_frames`, default 768),
 uses `recent_frames_only` to mark the most recent chunks as the recent window,
 scores *only* the non-recent frames with SigLIP cosine similarity, selects the
 top-K historical frames, then unions them with the recent frames and sorts
@@ -503,7 +510,7 @@ Use `--max_samples_per_subset 50` to sample up to 50 examples independently
 from each OVO subset/task within those splits. `--max_analysis_frames` and
 `--max_frames` are accepted only as deprecated no-op arguments for backward
 compatibility; Test 4 always scores all non-recent decoded frames after the
-qwen 768-frame decode cap.
+qwen decode cap set by `--decode_max_frames`.
 
 Like Test 1-2's attention scoring run, Test 4 also saves a small per-task
 bank of Qwen3-VL question-prefill self-attention examples (captured over the
@@ -521,33 +528,79 @@ interpolated into the result directory and log filename so runs with
 different K land in distinct paths.
 
 ```bash
-TOP_K=5
+# run with flash_attention_2
+TOP_K=4
+DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
 CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test4.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}" \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash" \
     --analysis_scope full \
     --recent_frames_only 4 \
+    --max_samples_per_subset 50 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
     --top_k_historical "${TOP_K}" \
     --chunk_duration 1.0 \
     --fps 1.0 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
-    --save_example_matrices 5 \
-    --attn_implementation eager \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}.log" 2>&1 &
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation flash_attention_2 \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash.log" 2>&1 &
 ```
 
-Smoke run (8 samples per split):
+```bash
+TOP_K=8
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test4.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --max_samples_per_subset 50 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation flash_attention_2 \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash.log" 2>&1 &
+
+```
+
+Smoke run (1 sample per split):
 
 ```bash
-TOP_K=5
-accelerate launch --num_processes 1 main_experiments/eval_qwen3vl_ovo_test4.py \
+TOP_K=4
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_test4.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --analysis_scope smoke \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --max_samples_per_split 1 \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_smoke_${TOP_K}" \
     --recent_frames_only 4 \
-    --top_k_historical "${TOP_K}"
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation eager \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_smoke_${TOP_K}.log" 2>&1 &
 ```
 
 Render per-example attention heatmaps from a saved V-RAG result directory.

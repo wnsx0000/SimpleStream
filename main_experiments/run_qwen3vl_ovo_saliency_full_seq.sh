@@ -11,6 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-8B-Instruct}"
 SIGLIP_MODEL_NAME="${SIGLIP_MODEL_NAME:-google/siglip-so400m-patch14-384}"
+SIGLIP_DEVICE="${SIGLIP_DEVICE:-auto}"
 ANNO_PATH="${OVO_ANNO_PATH:-data/ovo_bench/ovo_bench_new.json}"
 CHUNKED_DIR="${OVO_CHUNKED_DIR:-data/ovo_bench/chunked_videos}"
 RESULT_ROOT="${OVO_RESULT_ROOT:-main_experiments/results}"
@@ -44,7 +45,10 @@ run_case() {
     )
 
     if [[ "${script_path}" == "main_experiments/eval_qwen3vl_ovo_test1_1.py" ]]; then
-        cmd+=(--siglip_model_name "${SIGLIP_MODEL_NAME}")
+        cmd+=(
+            --siglip_model_name "${SIGLIP_MODEL_NAME}"
+            --siglip_device "${SIGLIP_DEVICE}"
+        )
     else
         cmd+=(
             --model_path "${MODEL_PATH}"

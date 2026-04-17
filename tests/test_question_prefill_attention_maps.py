@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -28,6 +29,7 @@ from lib.frame_saliency_qwen3 import (  # noqa: E402
     build_question_prefill_attention_map_metadata,
     build_question_prefill_attention_maps,
     question_prefill_layer_indices,
+    resolve_siglip_device,
 )
 from lib.recent_window_eval import select_attention_frame_indices  # noqa: E402
 
@@ -86,6 +88,25 @@ class QuestionPrefillAttentionMapTests(unittest.TestCase):
         self.assertEqual(strategy, "uniform_with_recent_anchor")
         self.assertTrue({96, 97, 98, 99}.issubset(set(selected)))
         self.assertEqual(len(selected), 12)
+
+    def test_resolve_siglip_device_selects_most_free_visible_cuda(self) -> None:
+        def fake_mem_get_info(index: int) -> tuple[int, int]:
+            free_by_index = {0: 8, 1: 24, 2: 16}
+            return free_by_index[index] * 1024**3, 32 * 1024**3
+
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=3),
+            mock.patch.object(torch.cuda, "mem_get_info", side_effect=fake_mem_get_info),
+        ):
+            self.assertEqual(resolve_siglip_device(), torch.device("cuda:1"))
+
+    def test_resolve_siglip_device_honors_explicit_override(self) -> None:
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=3),
+        ):
+            self.assertEqual(resolve_siglip_device("cuda:2"), torch.device("cuda:2"))
 
     def test_allocate_proportional_bin_counts(self) -> None:
         counts = [4, 8, 12]
