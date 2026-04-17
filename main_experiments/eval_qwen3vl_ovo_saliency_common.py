@@ -37,7 +37,7 @@ class SaliencyExperimentConfig:
     attention_modes: list[str] = field(default_factory=list)
     save_example_matrices: int = 5
     save_raw_attn_examples: int = 0
-    max_analysis_frames: int = 40
+    max_analysis_frames: int = 768
     seed: int = 42
     extra_summary_config: dict[str, Any] = field(default_factory=dict)
 
@@ -60,7 +60,7 @@ def add_common_saliency_args(
     parser.add_argument("--save_example_matrices", type=int, default=5)
     if include_save_raw_attn_examples:
         parser.add_argument("--save_raw_attn_examples", type=int, default=0)
-    parser.add_argument("--max_analysis_frames", type=int, default=40)
+    parser.add_argument("--max_analysis_frames", type=int, default=768)
     parser.add_argument("--seed", type=int, default=42)
 
 

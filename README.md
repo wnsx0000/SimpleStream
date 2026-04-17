@@ -168,9 +168,12 @@ python scoring/score_ovo_bench.py \
 <summary><b>main results directory</b></summary>
 
 - qwen3-vl-8B reproducing: ovo_qwen3vl_recent4
-- test1-1 (SigLIP cosine similarity mean percentile): ovo_qwen3vl_siglip_subset20_20260415_151005
-- test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260415_185231
-- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): ovo_qwen3vl_siglip_top4_all_decoded_cap768_<RUN_TAG>
+- test1-1 (SigLIP cosine similarity mean percentile, use only 12 frames including recent 4 frames): ovo_qwen3vl_siglip_subset20_20260415_151005
+- test1-1 (SigLIP cosine similarity mean percentile, all decoded frames cap 768): ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820
+- test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260416_192329
+- test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames): ovo_qwen3vl_siglip_top4_all_20260415_205218_uniform
+- test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames including recent 4 frames): ovo_qwen3vl_siglip_top4_all_20260416_141554_always_recent4
+- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): 
 
 </details>
 
@@ -223,9 +226,13 @@ The pooled `plots/` directory additionally includes
 `question_prefill_frame_frame_maps_average.png` and
 `question_prefill_question_frame_maps_average.png`, averaged over the saved
 example subset only.
-If the sampled window is longer than `--max_analysis_frames`, SigLIP similarity
-and attention are computed on a uniform subsample while keeping the recent
-frames in the set.
+The SigLIP similarity test (test1-1) decodes the full video at `--fps 1.0`
+with the same `qwen_vl_utils` sampling policy used by Test 2, capped at
+`--max_analysis_frames` frames (default 768). Videos longer than this cap are
+uniformly sampled by `qwen_vl_utils`, with the recent 4 frames always
+included. SigLIP similarity is computed over all decoded frames.
+The attention saliency test (test1-2) still uses `--max_analysis_frames` to
+subsample frames via the `uniform_with_recent_anchor` policy.
 
 The combined runner `main_experiments/eval_qwen3vl_ovo_test1.py` is deprecated.
 Run SigLIP similarity and attention saliency with separate entrypoints.
@@ -272,20 +279,21 @@ python analysis/plot_recent_frame_saliency.py \
 ```
 
 siglip similarity test.
+Decodes all frames at fps 1.0 (capped at 768 by default) and computes SigLIP
+cosine similarity against the question for every decoded frame.
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_1.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test1_1.py \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir main_experiments/results/ovo_qwen3vl_siglip_subset20_$(date +%Y%m%d_%H%M%S) \
+    --result_dir main_experiments/results/ovo_qwen3vl_siglip_subset20_all_frames_$(date +%Y%m%d_%H%M%S) \
     --analysis_scope full \
     --max_samples_per_subset 20 \
     --recent_frames_only 4 \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --max_analysis_frames 12 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
-    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_subset20_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    > ./main_experiments/results/nohup_ovo_qwen3vl_siglip_subset20_all_frames_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
 Generate plots from a saved SigLIP similarity result directory.
@@ -431,7 +439,7 @@ subset is excluded.
 
 ```bash
 python analysis/plot_attn_top4_selection.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_<RUN_TAG>
+    --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer0_20260416_214018
 ```
 </details>
 

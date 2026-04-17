@@ -809,6 +809,7 @@ class SiglipOnlyRecent4FrameSaliencyAnalyzer:
             chunk_duration=chunk_duration,
             fps=fps,
             recent_frames_only=recent_frames_only,
+            max_frames=max_analysis_frames,
         )
         if not chunks:
             raise ValueError(f"No chunks decoded from video: {video_path}")
@@ -1021,6 +1022,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
             chunk_duration=chunk_duration,
             fps=fps,
             recent_frames_only=recent_frames_only,
+            max_frames=max_analysis_frames,
         )
         if not chunks:
             raise ValueError(f"No chunks decoded from video: {video_path}")
