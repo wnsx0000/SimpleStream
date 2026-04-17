@@ -173,7 +173,12 @@ python scoring/score_ovo_bench.py \
 - test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260416_192329
 - test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames): ovo_qwen3vl_siglip_top4_all_20260415_205218_uniform
 - test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames including recent 4 frames): ovo_qwen3vl_siglip_top4_all_20260416_141554_always_recent4
-- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): 
+- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): -
+- test3 (attention score based selection, layer 0):
+- test3 (attention score based selection, layer 18):
+- test3 (attention score based selection, layer 32):
+- test3 (attention score based selection, layer 35):
+- test4 (Visual-RAG: SigLIP top-5 non-recent frames + recent 4 frames, qwen cap 768): -
 
 </details>
 
@@ -300,7 +305,7 @@ Generate plots from a saved SigLIP similarity result directory.
 
 ```bash
 python analysis/plot_siglip_similarity.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_siglip_subset20_20260415_151005
+    --result-dir main_experiments/results/ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820
 ```
 </details>
 
@@ -458,6 +463,101 @@ subset is excluded.
 ```bash
 python analysis/plot_attn_top4_selection.py \
     --result-dir main_experiments/results/ovo_qwen3vl_attn_top4_layer18_20260416_214018
+```
+</details>
+
+<details>
+<summary><b>Test 4</b></summary>
+
+Runs OVO-Bench backward/realtime evaluation with Visual-RAG (V-RAG) frame
+selection as described in the SimpleStream paper (Section 5.1, Table 4):
+the recent N frames are always kept, and the top-K most similar *non-recent*
+frames are retrieved by SigLIP cosine similarity against the question and
+appended to the recent-frame input before Qwen3-VL generates an answer. K
+is set by `--top_k_historical` (default 5 to match the paper). The
+HLD backward-tracing subset is excluded.
+
+For each sample, the script decodes the full video at `--fps 1.0` with the
+same `qwen_vl_utils` sampling policy used by Test 2 (capped at 768 frames),
+uses `recent_frames_only` to mark the most recent chunks as the recent window,
+scores *only* the non-recent frames with SigLIP cosine similarity, selects the
+top-K historical frames, then unions them with the recent frames and sorts
+the union temporally before Qwen3-VL inference. When fewer than K non-recent
+frames exist (very short videos), it uses whatever historical frames are
+available (possibly zero, falling back to the recent-only baseline).
+
+Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
+`qwen3vl_vrag_top{K}_results_*.json` (K is interpolated from
+`--top_k_historical`). Each record includes `recent_frame_indices`,
+`recent_chunk_ids`, `historical_candidate_frame_indices`,
+`historical_candidate_frame_scores`,
+`selected_historical_frame_indices_by_similarity`,
+`selected_historical_frame_indices`, `selected_historical_frames` (with
+similarity score and rank per frame), `combined_frame_indices_for_inference`,
+`combined_frame_relative_positions`, and `combined_frame_mean_relative_position`.
+`summary.json` reports subset/task accuracy, split-level official averages and
+pooled accuracy, plus both `Official Total Avg.` and `Pooled Overall Acc.` for
+the full run.
+
+Use `--max_samples_per_subset 50` to sample up to 50 examples independently
+from each OVO subset/task within those splits. `--max_analysis_frames` and
+`--max_frames` are accepted only as deprecated no-op arguments for backward
+compatibility; Test 4 always scores all non-recent decoded frames after the
+qwen 768-frame decode cap.
+
+Like Test 1-2's attention scoring run, Test 4 also saves a small per-task
+bank of Qwen3-VL question-prefill self-attention examples (captured over the
+combined recent + top-5 historical frame input) so that the attention
+heatmaps can be rendered offline. `--save_example_matrices` (default 5) sets
+the per-task cap; set it to 0 to skip capture entirely. Attention capture
+requires `--attn_implementation eager` (the default). Each saved example is
+written as a `.pt` file under `<result_dir>/examples/` with metadata
+including the recent/historical/combined frame indices and the SigLIP scores,
+and the attention payload matches the schema consumed by
+`analysis/plot_vrag_attention_heatmap.py`.
+
+V-RAG top-K non-recent test. `TOP_K` controls `--top_k_historical` and is
+interpolated into the result directory and log filename so runs with
+different K land in distinct paths.
+
+```bash
+TOP_K=5
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test4.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --top_k_historical "${TOP_K}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --save_example_matrices 5 \
+    --attn_implementation eager \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}.log" 2>&1 &
+```
+
+Smoke run (8 samples per split):
+
+```bash
+TOP_K=5
+accelerate launch --num_processes 1 main_experiments/eval_qwen3vl_ovo_test4.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --analysis_scope smoke \
+    --recent_frames_only 4 \
+    --top_k_historical "${TOP_K}"
+```
+
+Render per-example attention heatmaps from a saved V-RAG result directory.
+Only the question-prefill frame-frame and question-frame heatmap panels are
+written (under `<result_dir>/plots/examples/<example_key>/`); no aggregate
+bar/line summaries are produced.
+
+```bash
+python analysis/plot_vrag_attention_heatmap.py \
+    --result-dir main_experiments/results/ovo_qwen3vl_vrag_top5_20260417_120000
 ```
 </details>
 

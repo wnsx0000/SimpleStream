@@ -1,0 +1,918 @@
+"""
+OVO-Bench Visual-RAG top-5 historical frame evaluation for Qwen3-VL.
+
+This script implements the Visual-RAG (V-RAG) ablation from SimpleStream: the
+recent N frames are always kept, and the top-5 *non-recent* frames are
+retrieved by SigLIP cosine similarity against the question and appended to
+the recent-frame input before Qwen3-VL generates an answer. Video decoding
+follows qwen_vl_utils sampling and caps decoded frames at 768.
+
+When ``--save_example_matrices`` > 0, the script additionally captures
+Qwen3-VL question-prefill self-attention over the combined (recent + top-5
+historical) input and writes per-example ``.pt`` payloads under
+``<result_dir>/examples/``; these can be rendered into attention heatmaps
+with ``analysis/plot_vrag_attention_heatmap.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import random
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import torch
+
+os.environ.setdefault("NCCL_TIMEOUT", "7200")
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
+
+from accelerate import Accelerator
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from ovo_constants import BACKWARD_TASKS, REAL_TIME_TASKS
+from lib.frame_saliency_qwen3 import (
+    LayerwiseFrameAttentionCollector,
+    Qwen3Recent4FrameSaliencyAnalyzer,
+    SiglipFrameEncoder,
+    build_question_prefill_attention_map_metadata,
+    cosine_scores_against_query,
+    flatten_chunks,
+    frame_token_counts_from_grid,
+    question_prefill_layer_indices,
+    slugify,
+)
+from lib.recent_window_eval import (
+    build_ovo_prompt,
+    decode_video_to_chunks_qwen,
+    load_jsonl_results,
+    score_ovo_br,
+)
+from main_experiments.eval_qwen3vl_ovo_saliency_common import (
+    format_task_counts,
+    select_split_annotations,
+    smoke_cap_or_default,
+)
+
+EXCLUDED_FORWARD_TASKS = ("REC", "SSR", "CRR")
+EXCLUDED_BACKWARD_TASKS = frozenset({"HLD"})
+EVAL_BACKWARD_TASKS = [task for task in BACKWARD_TASKS if task not in EXCLUDED_BACKWARD_TASKS]
+EVAL_TASK_SET = frozenset([*EVAL_BACKWARD_TASKS, *REAL_TIME_TASKS])
+DEFAULT_TOP_K_HISTORICAL_FRAMES = 5
+DECODE_MAX_FRAMES = 768
+CANDIDATE_FRAME_POLICY = "non_recent_frames"
+ANALYSIS_SAMPLING_STRATEGY = "non_recent_frames_qwen_cap768"
+
+
+def format_model_label(top_k_historical: int) -> str:
+    return f"Qwen3-VL-V-RAG-Top{int(top_k_historical)}"
+
+
+def make_ovo_key(item: dict[str, Any]) -> str:
+    return f"{item.get('task', '')}:{item.get('id')}"
+
+
+def infer_split_name(task: str) -> str:
+    if task in EVAL_BACKWARD_TASKS:
+        return "backward"
+    if task in REAL_TIME_TASKS:
+        return "realtime"
+    return "unknown"
+
+
+def get_checkpoint_path(result_dir: str, process_index: int, num_processes: int) -> str:
+    if num_processes == 1:
+        os.makedirs(result_dir, exist_ok=True)
+        return os.path.join(result_dir, "results_incremental.jsonl")
+    shard_dir = os.path.join(result_dir, f"rank_{process_index}")
+    os.makedirs(shard_dir, exist_ok=True)
+    return os.path.join(shard_dir, "results_incremental.jsonl")
+
+
+def get_done_path(result_dir: str, process_index: int, num_processes: int) -> str:
+    if num_processes == 1:
+        os.makedirs(result_dir, exist_ok=True)
+        return os.path.join(result_dir, "done")
+    shard_dir = os.path.join(result_dir, f"rank_{process_index}")
+    os.makedirs(shard_dir, exist_ok=True)
+    return os.path.join(shard_dir, "done")
+
+
+def strip_internal_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if key != "_key"}
+
+
+def load_checkpoint_state(
+    path: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], set[str], Counter]:
+    records, done_keys = load_jsonl_results(path)
+    backward_results: list[dict[str, Any]] = []
+    realtime_results: list[dict[str, Any]] = []
+    forward_results: list[dict[str, Any]] = []
+    saved_examples_by_task: Counter = Counter()
+
+    for raw in records:
+        item = strip_internal_fields(raw)
+        if str(item.get("task", "")) not in EVAL_TASK_SET:
+            continue
+        key = raw.get("_key")
+        if not isinstance(key, str) or not key:
+            key = make_ovo_key(item)
+        done_keys.add(key)
+        split_name = str(item.get("split") or infer_split_name(str(item.get("task", ""))))
+        if split_name == "backward":
+            backward_results.append(item)
+        elif split_name == "realtime":
+            realtime_results.append(item)
+        if item.get("matrix_example_saved"):
+            saved_examples_by_task[str(item.get("task", ""))] += 1
+
+    return backward_results, realtime_results, forward_results, done_keys, saved_examples_by_task
+
+
+def append_checkpoint_row(handle: Any, item: dict[str, Any]) -> None:
+    record = dict(item)
+    record["_key"] = make_ovo_key(item)
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
+
+
+def merge_shard_results(result_dir: str, num_processes: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    checkpoint_paths = (
+        [os.path.join(result_dir, "results_incremental.jsonl")]
+        if num_processes == 1
+        else [os.path.join(result_dir, f"rank_{rank}", "results_incremental.jsonl") for rank in range(num_processes)]
+    )
+
+    backward_results: list[dict[str, Any]] = []
+    realtime_results: list[dict[str, Any]] = []
+    forward_results: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    for path in checkpoint_paths:
+        records, _ = load_jsonl_results(path)
+        for raw in records:
+            item = strip_internal_fields(raw)
+            if str(item.get("task", "")) not in EVAL_TASK_SET:
+                continue
+            key = raw.get("_key")
+            if not isinstance(key, str) or not key:
+                key = make_ovo_key(item)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            split_name = str(item.get("split") or infer_split_name(str(item.get("task", ""))))
+            if split_name == "backward":
+                backward_results.append(item)
+            elif split_name == "realtime":
+                realtime_results.append(item)
+
+    return backward_results, realtime_results, forward_results
+
+
+def write_done_marker(path: str) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(datetime.now().isoformat() + "\n")
+
+
+def wait_for_done_markers(result_dir: str, num_processes: int) -> None:
+    if num_processes <= 1:
+        return
+
+    timeout_seconds = float(os.environ.get("FILE_SYNC_TIMEOUT_SECONDS", "43200"))
+    poll_interval = float(os.environ.get("FILE_SYNC_POLL_SECONDS", "10"))
+    done_paths = [os.path.join(result_dir, f"rank_{rank}", "done") for rank in range(num_processes)]
+    deadline = time.time() + timeout_seconds
+
+    while True:
+        missing = [path for path in done_paths if not os.path.exists(path)]
+        if not missing:
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(f"Timed out waiting for rank completion markers: {missing}")
+        time.sleep(poll_interval)
+
+
+def write_json(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def decode_full_video_to_chunks(
+    *,
+    video_path: str,
+    chunk_duration: float,
+    fps: float,
+) -> tuple[list[Any], str]:
+    saved_exact_recent = os.environ.pop("QWEN_EXACT_RECENT_DECODE", None)
+    try:
+        return decode_video_to_chunks_qwen(
+            video_path=video_path,
+            chunk_duration=chunk_duration,
+            fps=fps,
+            recent_frames_only=None,
+            max_frames=DECODE_MAX_FRAMES,
+        )
+    finally:
+        if saved_exact_recent is not None:
+            os.environ["QWEN_EXACT_RECENT_DECODE"] = saved_exact_recent
+
+
+def score_record(record: dict[str, Any]) -> int:
+    if record.get("correct") is not None:
+        return int(record["correct"])
+    return int(score_ovo_br(record.get("response"), str(record.get("ground_truth", ""))))
+
+
+def build_eval_summary(
+    *,
+    backward_results: list[dict[str, Any]],
+    realtime_results: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    split_specs = (
+        ("backward", "Backward Tracing", EVAL_BACKWARD_TASKS, backward_results),
+        ("realtime", "Real-time Perception", REAL_TIME_TASKS, realtime_results),
+    )
+
+    split_payloads: dict[str, Any] = {}
+    official_split_avgs: list[float] = []
+    total_correct = 0
+    total_count = 0
+
+    for split_name, split_title, task_order, records in split_specs:
+        subset_rows: list[dict[str, Any]] = []
+        subsets: dict[str, Any] = {}
+        split_correct = 0
+        split_total = 0
+
+        for task in task_order:
+            task_records = [record for record in records if str(record.get("task", "")) == task]
+            if not task_records:
+                continue
+
+            task_correct = sum(score_record(record) for record in task_records)
+            task_total = len(task_records)
+            task_accuracy = 100.0 * float(task_correct) / float(task_total)
+            row = {
+                "task": task,
+                "correct": task_correct,
+                "total": task_total,
+                "accuracy": task_accuracy,
+            }
+            subset_rows.append(row)
+            subsets[task] = row
+            split_correct += task_correct
+            split_total += task_total
+
+        official_split_avg = (
+            sum(row["accuracy"] for row in subset_rows) / len(subset_rows)
+            if subset_rows
+            else 0.0
+        )
+        pooled_accuracy = 100.0 * float(split_correct) / float(split_total) if split_total else 0.0
+        split_payloads[split_name] = {
+            "title": split_title,
+            "subset_accuracy_list": subset_rows,
+            "subsets": subsets,
+            "official_split_avg": official_split_avg,
+            "pooled_accuracy": pooled_accuracy,
+            "correct": split_correct,
+            "total": split_total,
+        }
+
+        if subset_rows:
+            official_split_avgs.append(official_split_avg)
+        total_correct += split_correct
+        total_count += split_total
+
+    official_total_avg = (
+        sum(official_split_avgs) / len(official_split_avgs)
+        if official_split_avgs
+        else 0.0
+    )
+    pooled_overall_accuracy = 100.0 * float(total_correct) / float(total_count) if total_count else 0.0
+
+    return {
+        "config": config,
+        "splits": split_payloads,
+        "overall": {
+            "official_total_avg": official_total_avg,
+            "pooled_overall_accuracy": pooled_overall_accuracy,
+            "correct": total_correct,
+            "total": total_count,
+        },
+    }
+
+
+def print_eval_summary(model_label: str, summary: dict[str, Any]) -> None:
+    print("\n" + "=" * 60)
+    print(f"OVO-Bench Visual-RAG Results ({model_label})")
+    print("=" * 60)
+
+    for split_name in ("backward", "realtime"):
+        split_summary = summary.get("splits", {}).get(split_name, {})
+        subset_rows = split_summary.get("subset_accuracy_list", [])
+        if not subset_rows:
+            continue
+
+        print(f"\n{split_summary.get('title', split_name.title())}:")
+        for row in subset_rows:
+            print(f"  {row['task']}: {row['accuracy']:.2f}% ({row['correct']}/{row['total']})")
+        print(f"  Official Avg.: {split_summary['official_split_avg']:.2f}%")
+        print(
+            f"  Pooled Acc.: {split_summary['pooled_accuracy']:.2f}% "
+            f"({split_summary['correct']}/{split_summary['total']})"
+        )
+
+    overall = summary.get("overall", {})
+    print(f"\n{'=' * 60}")
+    print(f"Official Total Avg.: {float(overall.get('official_total_avg', 0.0)):.2f}%")
+    print(
+        f"Pooled Overall Acc.: {float(overall.get('pooled_overall_accuracy', 0.0)):.2f}% "
+        f"({int(overall.get('correct', 0))}/{int(overall.get('total', 0))})"
+    )
+    print("=" * 60)
+
+
+def capture_question_prefill_attention_maps(
+    *,
+    qa: Qwen3Recent4FrameSaliencyAnalyzer,
+    combined_frames: list[Any],
+    combined_frame_indices: list[int],
+    question_text: str,
+) -> dict[str, Any] | None:
+    if not combined_frames or not question_text:
+        return None
+
+    cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
+    frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, qa.merge_size)
+
+    text_layers = qa._get_text_layers()
+    num_text_layers = len(text_layers)
+    display_layer_indices = question_prefill_layer_indices(num_text_layers)
+
+    question_only_inputs = qa._build_cached_multimodal_inputs(
+        cached_embeds=cached_embeds,
+        cached_grid_thw=cached_grid_thw,
+        frame_token_counts=frame_token_counts,
+        question=question_text,
+    )
+    map_metadata = build_question_prefill_attention_map_metadata(
+        frame_token_spans=question_only_inputs["frame_token_spans"],
+        query_positions=question_only_inputs["question_token_positions"],
+        attention_frame_indices=combined_frame_indices,
+    )
+    collector = LayerwiseFrameAttentionCollector(
+        frame_token_spans=question_only_inputs["frame_token_spans"],
+        query_positions=question_only_inputs["question_token_positions"],
+        num_layers=num_text_layers,
+        save_raw=False,
+        map_layer_indices=display_layer_indices,
+        question_prefill_map_metadata=map_metadata,
+    )
+    _ = qa._run_with_collector(
+        collector,
+        use_cache=False,
+        input_ids=None,
+        inputs_embeds=question_only_inputs["inputs_embeds"],
+        attention_mask=question_only_inputs["attention_mask"],
+        position_ids=question_only_inputs["position_ids"],
+    )
+    attention_map_payload = collector.export_question_prefill_attention_maps(display_layer_indices)
+    prefill_scores = collector.as_tensor()
+    display_scores = prefill_scores[display_layer_indices]
+
+    return {
+        "question_prefill_attention_maps": attention_map_payload,
+        "question_prefill_attention_scores": display_scores.detach().cpu(),
+        "question_prefill_display_layer_indices": [int(i) for i in display_layer_indices],
+    }
+
+
+def save_example_payload(
+    *,
+    examples_dir: Path,
+    key: str,
+    anno: dict[str, Any],
+    split_name: str,
+    video_path: str,
+    decode_backend: str,
+    recent_frame_indices: list[int],
+    recent_chunk_ids: list[int],
+    historical_candidate_indices: list[int],
+    historical_candidate_scores: list[float],
+    selected_historical_frame_indices_by_similarity: list[int],
+    selected_historical_frame_indices: list[int],
+    combined_frame_indices: list[int],
+    similarity_text: str,
+    attention_payload: dict[str, Any],
+) -> Path:
+    example_payload: dict[str, Any] = {
+        "split": split_name,
+        "task": anno["task"],
+        "id": anno["id"],
+        "question": anno.get("question"),
+        "video_path": video_path,
+        "decode_backend": decode_backend,
+        "recent_frame_indices": [int(i) for i in recent_frame_indices],
+        "recent_chunk_ids": [int(i) for i in recent_chunk_ids],
+        "historical_candidate_frame_indices": [int(i) for i in historical_candidate_indices],
+        "historical_candidate_frame_scores": [float(s) for s in historical_candidate_scores],
+        "selected_historical_frame_indices_by_similarity": [int(i) for i in selected_historical_frame_indices_by_similarity],
+        "selected_historical_frame_indices": [int(i) for i in selected_historical_frame_indices],
+        "combined_frame_indices_for_inference": [int(i) for i in combined_frame_indices],
+        "similarity_text": similarity_text,
+    }
+    example_payload.update(attention_payload)
+
+    examples_dir.mkdir(parents=True, exist_ok=True)
+    example_name = slugify(key) or f"example-{anno.get('id', 'unknown')}"
+    example_path = examples_dir / f"{example_name}.pt"
+    torch.save(example_payload, example_path)
+    return example_path
+
+
+def evaluate_vrag_top5_backward_realtime(
+    *,
+    anno: dict[str, Any],
+    split_name: str,
+    chunked_dir: str,
+    qa: Qwen3Recent4FrameSaliencyAnalyzer,
+    siglip_encoder: SiglipFrameEncoder,
+    chunk_duration: float,
+    fps: float,
+    recent_frames_only: int,
+    top_k_historical: int,
+    examples_dir: Path | None = None,
+    save_example: bool = False,
+) -> dict[str, Any]:
+    video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    prompt = build_ovo_prompt(anno["task"], anno)
+    similarity_text = str(anno.get("question", "")).strip() or prompt
+    ground_truth = chr(65 + int(anno["gt"]))
+
+    chunks, decode_backend = decode_full_video_to_chunks(
+        video_path=video_path,
+        chunk_duration=chunk_duration,
+        fps=fps,
+    )
+    if not chunks:
+        raise ValueError(f"No chunks decoded from video: {video_path}")
+
+    frames, frame_rows, recent_indices, recent_chunk_ids = flatten_chunks(chunks, recent_frames_only)
+    num_sampled_frames = len(frames)
+    del chunks
+
+    if num_sampled_frames == 0:
+        raise ValueError(f"No frames decoded from video: {video_path}")
+
+    recent_index_set = set(int(i) for i in recent_indices)
+    historical_candidate_indices = [i for i in range(num_sampled_frames) if i not in recent_index_set]
+
+    historical_candidate_scores: list[float] = []
+    selected_historical_frame_indices_by_similarity: list[int] = []
+    similarity_rank_by_frame_index: dict[int, int] = {}
+    similarity_score_by_frame_index: dict[int, float] = {}
+
+    if historical_candidate_indices:
+        historical_frames = [frames[frame_index] for frame_index in historical_candidate_indices]
+        siglip_features = siglip_encoder.encode_frames(historical_frames)
+        siglip_question_feature = siglip_encoder.encode_text(similarity_text)
+        historical_candidate_scores = cosine_scores_against_query(
+            siglip_features, siglip_question_feature
+        ).tolist()
+        del historical_frames, siglip_features, siglip_question_feature
+
+        top_k = min(int(top_k_historical), len(historical_candidate_scores))
+        ranked_candidate_positions = sorted(
+            range(len(historical_candidate_scores)),
+            key=lambda position: -float(historical_candidate_scores[position]),
+        )[:top_k]
+        selected_historical_frame_indices_by_similarity = [
+            int(historical_candidate_indices[position]) for position in ranked_candidate_positions
+        ]
+        similarity_rank_by_frame_index = {
+            int(historical_candidate_indices[position]): rank
+            for rank, position in enumerate(ranked_candidate_positions, start=1)
+        }
+        similarity_score_by_frame_index = {
+            int(historical_candidate_indices[position]): float(historical_candidate_scores[position])
+            for position in ranked_candidate_positions
+        }
+
+    selected_historical_frame_indices = sorted(selected_historical_frame_indices_by_similarity)
+    combined_frame_indices = sorted(set(selected_historical_frame_indices) | recent_index_set)
+    if not combined_frame_indices:
+        raise ValueError(f"No frames selected for inference: {video_path}")
+
+    combined_frames = [frames[frame_index] for frame_index in combined_frame_indices]
+
+    relative_position_denom = max(1, num_sampled_frames - 1)
+    combined_frame_relative_positions = [
+        float(frame_index) / float(relative_position_denom)
+        for frame_index in combined_frame_indices
+    ]
+    combined_frame_mean_relative_position = (
+        float(sum(combined_frame_relative_positions)) / len(combined_frame_relative_positions)
+        if combined_frame_relative_positions
+        else 0.0
+    )
+
+    t0 = time.perf_counter()
+    response = qa.generate_from_frames(combined_frames, prompt)
+    generate_time = time.perf_counter() - t0
+
+    example_path: Path | None = None
+    example_save_error: str | None = None
+    if save_example and examples_dir is not None:
+        try:
+            attention_payload = capture_question_prefill_attention_maps(
+                qa=qa,
+                combined_frames=combined_frames,
+                combined_frame_indices=combined_frame_indices,
+                question_text=similarity_text,
+            )
+            if attention_payload is not None:
+                key = make_ovo_key(anno)
+                example_path = save_example_payload(
+                    examples_dir=examples_dir,
+                    key=key,
+                    anno=anno,
+                    split_name=split_name,
+                    video_path=video_path,
+                    decode_backend=decode_backend,
+                    recent_frame_indices=recent_indices,
+                    recent_chunk_ids=recent_chunk_ids,
+                    historical_candidate_indices=historical_candidate_indices,
+                    historical_candidate_scores=historical_candidate_scores,
+                    selected_historical_frame_indices_by_similarity=selected_historical_frame_indices_by_similarity,
+                    selected_historical_frame_indices=selected_historical_frame_indices,
+                    combined_frame_indices=combined_frame_indices,
+                    similarity_text=similarity_text,
+                    attention_payload=attention_payload,
+                )
+        except Exception as exc:
+            example_save_error = f"{type(exc).__name__}: {exc}"
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    selected_historical_frame_rows = [
+        {
+            "frame_index": int(frame_rows[frame_index]["frame_index"]),
+            "chunk_index": int(frame_rows[frame_index]["chunk_index"]),
+            "timestamp": float(frame_rows[frame_index]["timestamp"]),
+            "is_recent": bool(frame_rows[frame_index]["is_recent"]),
+            "similarity_score": similarity_score_by_frame_index[int(frame_index)],
+            "similarity_rank": similarity_rank_by_frame_index[int(frame_index)],
+        }
+        for frame_index in selected_historical_frame_indices
+    ]
+    final_chunk_ids = sorted(
+        {int(frame_rows[frame_index]["chunk_index"]) for frame_index in combined_frame_indices}
+    )
+    correct = int(score_ovo_br(response, ground_truth))
+
+    del combined_frames
+
+    return {
+        "id": anno["id"],
+        "video": anno["video"],
+        "task": anno["task"],
+        "split": split_name,
+        "question": anno["question"],
+        "response": response,
+        "ground_truth": ground_truth,
+        "correct": correct,
+        "video_path": video_path,
+        "decode_backend": decode_backend,
+        "recent_chunk_ids": recent_chunk_ids,
+        "recent_frame_indices": recent_indices,
+        "num_sampled_frames": num_sampled_frames,
+        "num_historical_candidate_frames": len(historical_candidate_indices),
+        "historical_candidate_frame_indices": [int(i) for i in historical_candidate_indices],
+        "historical_candidate_frame_scores": [float(s) for s in historical_candidate_scores],
+        "analysis_sampling_strategy": ANALYSIS_SAMPLING_STRATEGY,
+        "selected_historical_frame_indices_by_similarity": selected_historical_frame_indices_by_similarity,
+        "selected_historical_frame_indices": [int(i) for i in selected_historical_frame_indices],
+        "selected_historical_frames": selected_historical_frame_rows,
+        "combined_frame_indices_for_inference": [int(i) for i in combined_frame_indices],
+        "combined_frame_relative_positions": combined_frame_relative_positions,
+        "combined_frame_mean_relative_position": combined_frame_mean_relative_position,
+        "final_chunk_ids": final_chunk_ids,
+        "generate_time": generate_time,
+        "ttft_seconds": float(getattr(qa, "_last_ttft_seconds", 0.0) or 0.0),
+        "num_vision_tokens": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_vision_tokens_before": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_vision_tokens_after": int(getattr(qa, "_last_num_vision_tokens", 0) or 0),
+        "num_frames": int(getattr(qa, "_last_num_vision_frames", len(combined_frame_indices)) or 0),
+        "matrix_example_saved": example_path is not None,
+        "example_path": str(example_path) if example_path is not None else None,
+        "example_save_error": example_save_error,
+    }
+
+
+def build_error_record(anno: dict[str, Any], split_name: str, chunked_dir: str, error: Exception) -> dict[str, Any]:
+    return {
+        "id": anno["id"],
+        "video": anno["video"],
+        "task": anno["task"],
+        "split": split_name,
+        "question": anno["question"],
+        "response": None,
+        "ground_truth": chr(65 + int(anno["gt"])),
+        "correct": 0,
+        "video_path": os.path.join(chunked_dir, f"{anno['id']}.mp4"),
+        "error": str(error),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OVO-Bench Visual-RAG top-5 historical frame evaluation for Qwen3-VL")
+    parser.add_argument("--model_path", required=True, help="Example: Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--anno_path", default="data/ovo_bench/ovo_bench_new.json")
+    parser.add_argument("--chunked_dir", default="data/ovo_bench/chunked_videos")
+    parser.add_argument("--result_dir", default="results/ovo_bench_vrag_top5_qwen3vl")
+    parser.add_argument("--recent_frames_only", type=int, default=4)
+    parser.add_argument(
+        "--max_analysis_frames",
+        "--max_frames",
+        dest="_deprecated_max_analysis_frames",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--chunk_duration", type=float, default=1.0)
+    parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument("--max_qa_tokens", type=int, default=256)
+    parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
+    parser.add_argument("--analysis_scope", choices=["smoke", "full"], default="full")
+    parser.add_argument("--max_samples_per_split", type=int, default=None)
+    parser.add_argument("--max_samples_per_subset", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--top_k_historical",
+        type=int,
+        default=DEFAULT_TOP_K_HISTORICAL_FRAMES,
+        help=(
+            "Number of non-recent frames to retrieve by SigLIP cosine similarity and "
+            "append to the recent-frame input before Qwen3-VL inference. Default: 5."
+        ),
+    )
+    parser.add_argument(
+        "--save_example_matrices",
+        type=int,
+        default=5,
+        help=(
+            "Save up to N per-task Qwen3-VL question-prefill attention examples under "
+            "<result_dir>/examples/ for later heatmap plotting. Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        default="eager",
+        help=(
+            "Attention backend for Qwen3-VL. 'eager' is required to return attention "
+            "weights when --save_example_matrices > 0."
+        ),
+    )
+    parser.add_argument(
+        "--model_device",
+        choices=["local_process", "auto"],
+        default="local_process",
+        help=(
+            "Model placement mode. "
+            "'local_process' keeps one full model replica per accelerate process. "
+            "'auto' uses Hugging Face device_map='auto' and requires --num_processes=1."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.max_samples_per_split is not None and args.max_samples_per_split < 1:
+        raise ValueError("--max_samples_per_split must be >= 1 when provided.")
+    if args.max_samples_per_subset is not None and args.max_samples_per_subset < 1:
+        raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
+    if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
+        raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
+    if args.top_k_historical < 0:
+        raise ValueError("--top_k_historical must be >= 0.")
+
+    model_label = format_model_label(args.top_k_historical)
+
+    accelerator = Accelerator()
+
+    if args.model_device == "auto" and accelerator.num_processes != 1:
+        raise ValueError("--model_device=auto requires accelerate --num_processes=1.")
+
+    split_sample_cap = (
+        None
+        if args.max_samples_per_subset is not None
+        else smoke_cap_or_default(args.analysis_scope, args.max_samples_per_split)
+    )
+
+    with open(args.anno_path, encoding="utf-8") as handle:
+        annotations = json.load(handle)
+
+    rng = random.Random(args.seed)
+    backward_anno, backward_available_counts, backward_selected_counts = select_split_annotations(
+        annotations,
+        EVAL_BACKWARD_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
+    realtime_anno, realtime_available_counts, realtime_selected_counts = select_split_annotations(
+        annotations,
+        REAL_TIME_TASKS,
+        rng,
+        max_samples_per_split=split_sample_cap,
+        max_samples_per_subset=args.max_samples_per_subset,
+    )
+
+    accelerator.print(f"\n{'=' * 60}")
+    accelerator.print(f"OVO-Bench Visual-RAG Top-{int(args.top_k_historical)} Evaluation ({model_label})")
+    accelerator.print(f"{'=' * 60}")
+    accelerator.print(f"Backward: {len(backward_anno)}, Realtime: {len(realtime_anno)}")
+    if EXCLUDED_BACKWARD_TASKS:
+        accelerator.print(f"Excluded backward tasks: {', '.join(sorted(EXCLUDED_BACKWARD_TASKS))}")
+    accelerator.print(f"Excluded forward tasks: {', '.join(EXCLUDED_FORWARD_TASKS)}")
+    accelerator.print(f"Processes: {accelerator.num_processes}")
+    accelerator.print(
+        f"Window: recent_frames_only={args.recent_frames_only}, "
+        f"decode_max_frames={DECODE_MAX_FRAMES}, "
+        f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
+        f"top_k_historical={int(args.top_k_historical)}, "
+        f"chunk_duration={args.chunk_duration}, fps={args.fps}"
+    )
+    accelerator.print(f"Scope: {args.analysis_scope}")
+    if args.max_samples_per_subset is not None:
+        accelerator.print(f"Sampling: up to {args.max_samples_per_subset} per subset/task")
+    elif split_sample_cap is not None:
+        accelerator.print(f"Sampling: up to {split_sample_cap} per split")
+    else:
+        accelerator.print("Sampling: full split")
+    accelerator.print(f"Backward subsets: {format_task_counts(EVAL_BACKWARD_TASKS, backward_selected_counts, backward_available_counts)}")
+    accelerator.print(f"Realtime subsets: {format_task_counts(REAL_TIME_TASKS, realtime_selected_counts, realtime_available_counts)}")
+    accelerator.print(f"{'=' * 60}\n")
+
+    evaluator = Qwen3Recent4FrameSaliencyAnalyzer(
+        model_name=args.model_path,
+        device="auto" if args.model_device == "auto" else accelerator.device,
+        max_new_tokens=args.max_qa_tokens,
+        attn_implementation=args.attn_implementation,
+        siglip_model_name=args.siglip_model_name,
+    )
+    siglip_encoder = evaluator.get_siglip_encoder()
+
+    with accelerator.split_between_processes(backward_anno) as local_backward:
+        local_backward = list(local_backward)
+    with accelerator.split_between_processes(realtime_anno) as local_realtime:
+        local_realtime = list(local_realtime)
+
+    checkpoint_path = get_checkpoint_path(args.result_dir, accelerator.process_index, accelerator.num_processes)
+    done_path = get_done_path(args.result_dir, accelerator.process_index, accelerator.num_processes)
+    if os.path.exists(done_path):
+        os.remove(done_path)
+    (
+        backward_results,
+        realtime_results,
+        forward_results,
+        done_keys,
+        saved_examples_by_task,
+    ) = load_checkpoint_state(checkpoint_path)
+
+    examples_dir = Path(args.result_dir) / "examples"
+    if args.save_example_matrices > 0:
+        examples_dir.mkdir(parents=True, exist_ok=True)
+    save_example_cap = int(args.save_example_matrices)
+
+    with open(checkpoint_path, "a", encoding="utf-8") as checkpoint_file:
+        split_jobs = (
+            ("backward", local_backward, backward_results),
+            ("realtime", local_realtime, realtime_results),
+        )
+        for split_name, local_annos, result_sink in split_jobs:
+            for anno in tqdm(
+                local_annos,
+                desc=f"[GPU{accelerator.process_index}] {split_name.title()}",
+                disable=not accelerator.is_local_main_process,
+            ):
+                key = make_ovo_key(anno)
+                if key in done_keys:
+                    continue
+                task_name = str(anno.get("task", ""))
+                save_example = (
+                    save_example_cap > 0
+                    and saved_examples_by_task[task_name] < save_example_cap
+                )
+                try:
+                    result = evaluate_vrag_top5_backward_realtime(
+                        anno=anno,
+                        split_name=split_name,
+                        chunked_dir=args.chunked_dir,
+                        qa=evaluator,
+                        siglip_encoder=siglip_encoder,
+                        chunk_duration=args.chunk_duration,
+                        fps=args.fps,
+                        recent_frames_only=args.recent_frames_only,
+                        top_k_historical=args.top_k_historical,
+                        examples_dir=examples_dir,
+                        save_example=save_example,
+                    )
+                    if result.get("matrix_example_saved"):
+                        saved_examples_by_task[task_name] += 1
+                except Exception as exc:
+                    result = build_error_record(anno, split_name, args.chunked_dir, exc)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                result_sink.append(result)
+                done_keys.add(key)
+                append_checkpoint_row(checkpoint_file, result)
+
+    write_done_marker(done_path)
+
+    if accelerator.is_main_process:
+        wait_for_done_markers(args.result_dir, accelerator.num_processes)
+        all_backward, all_realtime, all_forward = merge_shard_results(args.result_dir, accelerator.num_processes)
+
+        summary_config = {
+            "generated_at": datetime.now().isoformat(),
+            "model_label": model_label,
+            "model_path": args.model_path,
+            "siglip_model_name": args.siglip_model_name,
+            "anno_path": args.anno_path,
+            "chunked_dir": args.chunked_dir,
+            "result_dir": args.result_dir,
+            "analysis_scope": args.analysis_scope,
+            "recent_frames_only": args.recent_frames_only,
+            "decode_max_frames": DECODE_MAX_FRAMES,
+            "candidate_frame_policy": CANDIDATE_FRAME_POLICY,
+            "top_k_historical": int(args.top_k_historical),
+            "chunk_duration": args.chunk_duration,
+            "fps": args.fps,
+            "max_qa_tokens": args.max_qa_tokens,
+            "save_example_matrices": save_example_cap,
+            "attn_implementation": args.attn_implementation,
+            "max_samples_per_split": split_sample_cap,
+            "max_samples_per_subset": args.max_samples_per_subset,
+            "seed": args.seed,
+            "excluded_backward_tasks": sorted(EXCLUDED_BACKWARD_TASKS),
+            "excluded_forward_tasks": list(EXCLUDED_FORWARD_TASKS),
+            "sampling_counts": {
+                "backward": {
+                    "available": backward_available_counts,
+                    "selected": backward_selected_counts,
+                },
+                "realtime": {
+                    "available": realtime_available_counts,
+                    "selected": realtime_selected_counts,
+                },
+            },
+        }
+        summary = build_eval_summary(
+            backward_results=all_backward,
+            realtime_results=all_realtime,
+            config=summary_config,
+        )
+        print_eval_summary(model_label, summary)
+
+        os.makedirs(args.result_dir, exist_ok=True)
+        summary_path = os.path.join(args.result_dir, "summary.json")
+        write_json(summary_path, summary)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(
+            args.result_dir,
+            f"qwen3vl_vrag_top{int(args.top_k_historical)}_results_{timestamp}.json",
+        )
+        write_json(
+            output_path,
+            {
+                "config": summary_config,
+                "summary": summary,
+                "backward": all_backward,
+                "realtime": all_realtime,
+                "forward": all_forward,
+            },
+        )
+        print(f"\nSummary saved to: {summary_path}")
+        print(f"Results saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()

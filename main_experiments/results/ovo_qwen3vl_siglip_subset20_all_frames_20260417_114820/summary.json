@@ -1,0 +1,244 @@
+{
+  "config": {
+    "generated_at": "2026-04-17T13:24:43.315022",
+    "anno_path": "data/ovo_bench/ovo_bench_new.json",
+    "chunked_dir": "data/ovo_bench/chunked_videos",
+    "result_dir": "main_experiments/results/ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820",
+    "recent_frames_only": 4,
+    "chunk_duration": 1.0,
+    "fps": 1.0,
+    "analysis_scope": "full",
+    "max_samples_per_split": null,
+    "max_samples_per_subset": 20,
+    "excluded_backward_tasks": [
+      "HLD"
+    ],
+    "similarity_backends": [
+      "siglip"
+    ],
+    "attention_modes": [],
+    "save_example_matrices": 5,
+    "save_raw_attn_examples": 0,
+    "max_analysis_frames": 768,
+    "seed": 42,
+    "script": "eval_qwen3vl_ovo_test1_1.py",
+    "mode": "siglip_similarity",
+    "siglip_model_name": "google/siglip-so400m-patch14-384"
+  },
+  "total_records": 160,
+  "valid_records": 160,
+  "error_records": 0,
+  "metrics": {
+    "siglip_similarity": {
+      "count": 160,
+      "recent4_mean_percentile_mean": 0.6339646629734909,
+      "recent4_mean_percentile_std": 0.24672219426242603
+    }
+  },
+  "tasks": {
+    "ACR": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.686200679138014,
+          "recent4_mean_percentile_std": 0.2588081446367168
+        }
+      }
+    },
+    "ASI": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.6876353366135202,
+          "recent4_mean_percentile_std": 0.21178228767719787
+        }
+      }
+    },
+    "ATR": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.6305930319251369,
+          "recent4_mean_percentile_std": 0.22547838000246717
+        }
+      }
+    },
+    "EPM": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.6580805976724774,
+          "recent4_mean_percentile_std": 0.22249101621892478
+        }
+      }
+    },
+    "FPD": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.5082213292551019,
+          "recent4_mean_percentile_std": 0.25082535008932094
+        }
+      }
+    },
+    "OCR": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.6425416622460454,
+          "recent4_mean_percentile_std": 0.26627032152112085
+        }
+      }
+    },
+    "OJR": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.5878164523796579,
+          "recent4_mean_percentile_std": 0.2505424213753764
+        }
+      }
+    },
+    "STU": {
+      "count": 20,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 20,
+          "recent4_mean_percentile_mean": 0.6706282145579732,
+          "recent4_mean_percentile_std": 0.22946225301902046
+        }
+      }
+    }
+  },
+  "splits": {
+    "backward": {
+      "total_records": 40,
+      "valid_records": 40,
+      "error_records": 0,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 40,
+          "recent4_mean_percentile_mean": 0.6728579671429987,
+          "recent4_mean_percentile_std": 0.21770476679307443
+        }
+      },
+      "tasks": {
+        "ASI": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.6876353366135202,
+              "recent4_mean_percentile_std": 0.21178228767719787
+            }
+          }
+        },
+        "EPM": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.6580805976724774,
+              "recent4_mean_percentile_std": 0.22249101621892478
+            }
+          }
+        }
+      },
+      "task_mean_metrics": {
+        "siglip_similarity": {
+          "task_count": 2,
+          "recent4_mean_percentile_mean": 0.6728579671429988,
+          "recent4_mean_percentile_std": 0.014777369470521384
+        }
+      }
+    },
+    "realtime": {
+      "total_records": 120,
+      "valid_records": 120,
+      "error_records": 0,
+      "metrics": {
+        "siglip_similarity": {
+          "count": 120,
+          "recent4_mean_percentile_mean": 0.6210002282503216,
+          "recent4_mean_percentile_std": 0.2543456180540843
+        }
+      },
+      "tasks": {
+        "ACR": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.686200679138014,
+              "recent4_mean_percentile_std": 0.2588081446367168
+            }
+          }
+        },
+        "ATR": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.6305930319251369,
+              "recent4_mean_percentile_std": 0.22547838000246717
+            }
+          }
+        },
+        "FPD": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.5082213292551019,
+              "recent4_mean_percentile_std": 0.25082535008932094
+            }
+          }
+        },
+        "OCR": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.6425416622460454,
+              "recent4_mean_percentile_std": 0.26627032152112085
+            }
+          }
+        },
+        "OJR": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.5878164523796579,
+              "recent4_mean_percentile_std": 0.2505424213753764
+            }
+          }
+        },
+        "STU": {
+          "count": 20,
+          "metrics": {
+            "siglip_similarity": {
+              "count": 20,
+              "recent4_mean_percentile_mean": 0.6706282145579732,
+              "recent4_mean_percentile_std": 0.22946225301902046
+            }
+          }
+        }
+      },
+      "task_mean_metrics": {
+        "siglip_similarity": {
+          "task_count": 6,
+          "recent4_mean_percentile_mean": 0.6210002282503216,
+          "recent4_mean_percentile_std": 0.05928790506426378
+        }
+      }
+    }
+  }
+}
