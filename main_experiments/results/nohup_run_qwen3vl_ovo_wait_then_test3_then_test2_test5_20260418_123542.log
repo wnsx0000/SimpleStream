@@ -1,0 +1,11 @@
+nohup: ignoring input
+[2026-04-18 12:35:46] run tag: 20260418_123542
+[2026-04-18 12:35:46] result root: main_experiments/results
+[2026-04-18 12:35:46] dry run: 0
+[2026-04-18 12:35:46] no existing GPU process will be terminated by this script
+[2026-04-18 12:35:46] checking GPU availability for initial wait: GPUs 4,5,6,7
+[2026-04-18 12:35:46] waiting for GPUs 4,5,6,7 before initial wait; elapsed 00:00:00; busy processes:
+  GPU 4: 2973672, python, 12298
+  GPU 5: 2973672, python, 9558
+  GPU 6: 3015001, python, 12298
+  GPU 7: 3015001, python, 9558
