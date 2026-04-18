@@ -1043,7 +1043,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         cached_embeds = cached_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask = input_ids == self.image_token_id
         inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1).expand_as(inputs_embeds), cached_embeds)
-        position_ids, _ = text_model.get_rope_index(
+        position_ids, rope_deltas = text_model.get_rope_index(
             input_ids=input_ids,
             image_grid_thw=cached_grid_thw.to(text_device),
             video_grid_thw=None,
@@ -1051,9 +1051,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
         )
 
         return {
+            "input_ids": input_ids,
             "attention_mask": attention_mask,
             "inputs_embeds": inputs_embeds,
             "position_ids": position_ids,
+            "rope_deltas": rope_deltas,
             "question_token_positions": list(range(question_start, question_end)),
             "frame_token_spans": frame_token_spans,
         }

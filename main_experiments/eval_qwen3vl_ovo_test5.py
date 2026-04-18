@@ -86,6 +86,7 @@ DEFAULT_CHUNK_SIZE = 2
 DECODE_MAX_FRAMES = 768
 CANDIDATE_FRAME_POLICY = "non_recent_frames"
 ANALYSIS_SAMPLING_STRATEGY_PREFIX = "non_recent_frames_qwen_cap"
+VISION_ATTN_IMPLEMENTATION = "flash_attention_2"
 
 
 def format_model_label(top_k_historical: int, chunk_size: int) -> str:
@@ -216,6 +217,162 @@ def chunked_causal_mask_override(custom_4d_mask: torch.Tensor):
         yield
     finally:
         qwen3vl_mod.create_causal_mask = original_create_causal_mask
+
+
+@contextmanager
+def temporary_visual_attn_implementation(
+    qa: Qwen3Recent4FrameSaliencyAnalyzer,
+    attn_implementation: str,
+):
+    """Temporarily switch only the Qwen3-VL vision encoder attention backend.
+
+    Qwen3-VL's non-FA2 vision path currently hits a length mismatch for
+    multi-image inputs. The chunked 4D mask is needed only in the text decoder,
+    so vision features can still be encoded with FA2 before the text prefill
+    runs under ``sdpa`` or ``eager``.
+    """
+    config_candidates: list[Any] = []
+    visual = qa._get_visual_module()
+    if hasattr(visual, "config"):
+        config_candidates.append(visual.config)
+    for module in visual.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None:
+            config_candidates.append(module_config)
+    model_config = getattr(qa.model, "config", None)
+    if model_config is not None and hasattr(model_config, "vision_config"):
+        config_candidates.append(model_config.vision_config)
+    hf_config = getattr(qa._get_hf_model(), "config", None)
+    if hf_config is not None and hasattr(hf_config, "vision_config"):
+        config_candidates.append(hf_config.vision_config)
+
+    configs: list[Any] = []
+    seen: set[int] = set()
+    for config in config_candidates:
+        if config is None or id(config) in seen:
+            continue
+        seen.add(id(config))
+        configs.append(config)
+
+    previous_values = [
+        (
+            config,
+            getattr(config, "_attn_implementation", None),
+            hasattr(config, "_attn_implementation"),
+        )
+        for config in configs
+    ]
+    for config, _, _ in previous_values:
+        config._attn_implementation = attn_implementation
+    try:
+        yield
+    finally:
+        for config, previous_value, had_attr in previous_values:
+            if had_attr:
+                config._attn_implementation = previous_value
+            elif hasattr(config, "_attn_implementation"):
+                delattr(config, "_attn_implementation")
+
+
+def _eos_token_id_set(eos_token_id: Any) -> set[int]:
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, torch.Tensor):
+        return {int(token_id) for token_id in eos_token_id.detach().cpu().flatten().tolist()}
+    if isinstance(eos_token_id, (list, tuple, set)):
+        return {int(token_id) for token_id in eos_token_id}
+    return {int(eos_token_id)}
+
+
+@torch.inference_mode()
+def greedy_generate_with_chunked_prefill(
+    qa: Qwen3Recent4FrameSaliencyAnalyzer,
+    *,
+    inputs: dict[str, Any],
+    chunked_mask_4d: torch.Tensor,
+) -> str:
+    """Run a masked prefill directly, then continue deterministic greedy decode.
+
+    HF ``generate()`` may reshape/slice ``inputs_embeds`` before the first model
+    call. Test 5 needs the prefill sequence length to match the custom 4D mask
+    exactly, so the first forward pass is driven explicitly and subsequent
+    single-token steps use the returned KV cache with the normal causal mask.
+    """
+    inputs_embeds = inputs["inputs_embeds"]
+    attention_mask = inputs["attention_mask"]
+    position_ids = inputs["position_ids"]
+    rope_deltas = inputs["rope_deltas"]
+    seq_len = int(inputs_embeds.shape[1])
+
+    hf_model = qa._get_hf_model()
+    previous_rope_deltas = getattr(hf_model, "rope_deltas", None)
+    hf_model.rope_deltas = rope_deltas.to(inputs_embeds.device)
+    eos_token_ids = _eos_token_id_set(getattr(qa.model.generation_config, "eos_token_id", None))
+
+    t0 = time.perf_counter()
+    generated_tokens: list[torch.Tensor] = []
+    try:
+        with chunked_causal_mask_override(chunked_mask_4d):
+            outputs = qa.model(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=torch.arange(seq_len, device=inputs_embeds.device),
+                use_cache=True,
+                return_dict=True,
+                logits_to_keep=1,
+            )
+
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        qa._last_ttft_seconds = time.perf_counter() - t0
+        past_key_values = outputs.past_key_values
+        current_attention_mask = attention_mask
+
+        for _ in range(int(qa.max_new_tokens)):
+            token_for_decode = next_token.to(current_attention_mask.device)
+            generated_tokens.append(token_for_decode.detach().cpu())
+            if eos_token_ids and int(token_for_decode.item()) in eos_token_ids:
+                break
+
+            current_attention_mask = torch.cat(
+                [
+                    current_attention_mask,
+                    torch.ones(
+                        (current_attention_mask.shape[0], 1),
+                        dtype=current_attention_mask.dtype,
+                        device=current_attention_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+            cache_position = torch.tensor(
+                [int(current_attention_mask.shape[1] - 1)],
+                dtype=torch.long,
+                device=current_attention_mask.device,
+            )
+            outputs = qa.model(
+                input_ids=token_for_decode,
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                use_cache=True,
+                return_dict=True,
+                logits_to_keep=1,
+            )
+            past_key_values = outputs.past_key_values
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+        if not generated_tokens:
+            return ""
+        generated_ids = torch.cat(generated_tokens, dim=1)
+        return qa.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0].strip()
+    finally:
+        hf_model.rope_deltas = previous_rope_deltas
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
@@ -500,17 +657,16 @@ def generate_with_chunked_attention(
     combined_frame_indices: list[int],
     recent_index_set: set[int],
     chunk_size: int,
-    question: str,
     prompt: str,
 ) -> tuple[str, dict[str, Any]]:
     """Run Qwen3-VL generation with chunked attention over frame tokens.
 
     ``combined_frames`` / ``combined_frame_indices`` must be in temporal order and
-    aligned. ``question`` is the similarity text used to build the multimodal
-    input (mirrors the analyzer's question-prefill path); ``prompt`` is the
-    full OVO prompt passed to the assistant head as the user turn text.
+    aligned. ``prompt`` is the full OVO prompt passed to the assistant head as
+    the user turn text.
     """
-    cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
+    with temporary_visual_attn_implementation(qa, VISION_ATTN_IMPLEMENTATION):
+        cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
     try:
         frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, qa.merge_size)
         inputs = qa._build_cached_multimodal_inputs(
@@ -542,13 +698,11 @@ def generate_with_chunked_attention(
         qa._last_num_vision_tokens = int(cached_embeds.shape[0])
         qa._last_num_vision_frames = int(len(combined_frames))
 
-        with chunked_causal_mask_override(chunked_mask_4d):
-            response = qa._generate_from_model_inputs(
-                prompt_length=int(inputs_embeds.shape[1]),
-                inputs_embeds=inputs_embeds,
-                attention_mask=inputs["attention_mask"],
-                position_ids=inputs["position_ids"],
-            )
+        response = greedy_generate_with_chunked_prefill(
+            qa,
+            inputs=inputs,
+            chunked_mask_4d=chunked_mask_4d,
+        )
 
         chunk_metadata = {
             "chunk_size": int(chunk_size),
@@ -584,7 +738,8 @@ def capture_question_prefill_attention_maps(
     prefill_scores = None
 
     try:
-        cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
+        with temporary_visual_attn_implementation(qa, VISION_ATTN_IMPLEMENTATION):
+            cached_embeds, cached_grid_thw = qa.encode_vision(combined_frames)
         frame_token_counts = frame_token_counts_from_grid(cached_grid_thw, qa.merge_size)
 
         text_layers = qa._get_text_layers()
@@ -798,7 +953,6 @@ def evaluate_vrag_top5_backward_realtime(
         combined_frame_indices=combined_frame_indices,
         recent_index_set=recent_index_set,
         chunk_size=chunk_size,
-        question=similarity_text,
         prompt=prompt,
     )
     generate_time = time.perf_counter() - t0
@@ -985,10 +1139,11 @@ def main() -> None:
     parser.add_argument(
         "--save_example_matrices",
         type=int,
-        default=5,
+        default=0,
         help=(
             "Save up to N per-task Qwen3-VL question-prefill attention examples under "
-            "<result_dir>/examples/ for later heatmap plotting. Set to 0 to disable."
+            "<result_dir>/examples/ for later heatmap plotting. Requires "
+            "--attn_implementation=eager. Set to 0 to disable. Default: 0."
         ),
     )
     parser.add_argument(
@@ -1027,6 +1182,11 @@ def main() -> None:
         raise ValueError(
             "--attn_implementation=flash_attention_2 is not supported: flash_attention_2 "
             "does not accept arbitrary 4D attention masks. Use 'sdpa' (default) or 'eager'."
+        )
+    if args.save_example_matrices > 0 and args.attn_implementation != "eager":
+        raise ValueError(
+            "--save_example_matrices requires --attn_implementation=eager because "
+            "SDPA does not return attention weights for the saved heatmap payloads."
         )
 
     model_label = format_model_label(args.top_k_historical, args.chunk_size)
@@ -1078,7 +1238,8 @@ def main() -> None:
         f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
         f"top_k_historical={int(args.top_k_historical)}, "
         f"chunk_size={int(args.chunk_size)}, "
-        f"attn_implementation={args.attn_implementation}, "
+        f"text_attn_implementation={args.attn_implementation}, "
+        f"vision_attn_implementation={VISION_ATTN_IMPLEMENTATION}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
     )
     accelerator.print(f"Scope: {args.analysis_scope}")
@@ -1197,6 +1358,8 @@ def main() -> None:
             "max_qa_tokens": args.max_qa_tokens,
             "save_example_matrices": save_example_cap,
             "attn_implementation": args.attn_implementation,
+            "vision_attn_implementation": VISION_ATTN_IMPLEMENTATION,
+            "model_device": args.model_device,
             "max_samples_per_split": split_sample_cap,
             "max_samples_per_subset": args.max_samples_per_subset,
             "seed": args.seed,

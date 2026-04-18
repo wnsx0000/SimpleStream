@@ -323,11 +323,11 @@ Runs OVO-Bench backward/realtime evaluation with SigLIP-guided frame selection.
 The HLD backward-tracing subset is excluded.
 For each sample, the script decodes the full video at `--fps 1.0` with the
 same `qwen_vl_utils` sampling policy used by the Qwen-VL pipeline. Decoding is
-explicitly capped at 768 frames; videos longer than this are uniformly sampled
-across the full time range by `qwen_vl_utils`. The script computes SigLIP
-cosine similarity between every decoded frame and the question, selects the
-top-4 frames, then reorders those four frames temporally before Qwen3-VL
-inference.
+explicitly capped by `--decode_max_frames` (default 768); videos longer than
+this are uniformly sampled across the full time range by `qwen_vl_utils`. The
+script computes SigLIP cosine similarity between every decoded frame and the
+question, selects the top-4 frames, then reorders those four frames temporally
+before Qwen3-VL inference.
 
 Outputs are saved under `results_incremental.jsonl`, `summary.json`, and
 `qwen3vl_siglip_top4_results_*.json`. Each record includes
@@ -341,25 +341,28 @@ accuracy, split-level official averages and pooled accuracy, plus both
 Use `--max_samples_per_subset 50` to sample up to 50 examples independently
 from each OVO subset/task within those splits. `--max_analysis_frames` and
 `--max_frames` are accepted only as deprecated no-op arguments for backward
-compatibility; Test 2 always scores all decoded frames after the qwen 768-frame
-decode cap.
+compatibility; Test 2 always scores all decoded frames after the qwen decode
+cap set by `--decode_max_frames`.
 
 siglip top-4 full-candidate test.
 
 ```bash
+DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
 CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test2.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}" \
+    --result_dir "main_experiments/results/ovo_qwen3vl_siglip_top4_all_decoded_cap${DECODE_MAX_FRAMES}_${RUN_TAG}" \
     --analysis_scope full \
     --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
     --chunk_duration 1.0 \
     --fps 1.0 \
     --siglip_model_name google/siglip-so400m-patch14-384 \
     --siglip_device auto \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_decoded_cap768_${RUN_TAG}.log" 2>&1 &
+    --attn_implementation flash_attention_2 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_siglip_top4_all_decoded_cap${DECODE_MAX_FRAMES}_${RUN_TAG}.log" 2>&1 &
 ```
 
 Generate plots from a saved SigLIP top-4 result directory. The script reads
@@ -531,6 +534,7 @@ different K land in distinct paths.
 
 ```bash
 # run with flash_attention_2
+# --max_samples_per_subset 50 \
 TOP_K=4
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
@@ -541,7 +545,6 @@ CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test4.py
     --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash" \
     --analysis_scope full \
     --recent_frames_only 4 \
-    --max_samples_per_subset 50 \
     --decode_max_frames "${DECODE_MAX_FRAMES}" \
     --top_k_historical "${TOP_K}" \
     --chunk_duration 1.0 \
@@ -555,17 +558,17 @@ CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test4.py
 ```
 
 ```bash
+# --max_samples_per_subset 50 \
 TOP_K=8
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test4.py \
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test4.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
     --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_${RUN_TAG}_flash" \
     --analysis_scope full \
     --recent_frames_only 4 \
-    --max_samples_per_subset 50 \
     --decode_max_frames "${DECODE_MAX_FRAMES}" \
     --top_k_historical "${TOP_K}" \
     --chunk_duration 1.0 \
@@ -585,7 +588,7 @@ Smoke run (1 sample per split):
 TOP_K=4
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=4,5,6,7 python main_experiments/eval_qwen3vl_ovo_test4.py \
+CUDA_VISIBLE_DEVICES=4,5 python main_experiments/eval_qwen3vl_ovo_test4.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --analysis_scope smoke \
     --anno_path data/ovo_bench/ovo_bench_new.json \
@@ -650,37 +653,46 @@ manager that monkey-patches
 (`transformers/masking_utils.py:720-722`), so the mask is consumed as-is by
 every decoder layer. Decode steps (query length 1, with populated KV cache)
 fall through to the original function for standard causal behaviour.
+Generation is driven with an explicit masked prefill followed by greedy
+single-token decode, so Hugging Face `generate()` cannot reshape the cached
+`inputs_embeds` before the custom 4D mask is applied.
 `--attn_implementation` defaults to `sdpa` (fastest backend that supports
 arbitrary 4D float masks); `eager` is also supported.
 **`flash_attention_2` is not supported** (does not accept arbitrary 4D
-masks) and Test 5 fails fast if selected.
+masks) and Test 5 fails fast if selected for the text decoder. Vision
+feature encoding is temporarily run with `flash_attention_2`, matching Test
+4's working Qwen3-VL vision path; the chunked 4D mask is applied only in the
+text decoder prefill.
 
 Outputs mirror Test 4 (`results_incremental.jsonl`, `summary.json`, and
 `qwen3vl_vrag_top{K}_chunk{C}_results_*.json`) and additionally include
 `chunk_size`, `chunk_assignment_by_frame_index`, `retrieved_chunk_sizes`,
 `recent_chunk_id`, `num_retrieved_chunks`, and `num_chunks_total` per
-record. Each saved attention example also carries a `chunked_attention`
-dict with the same metadata, so `analysis/plot_vrag_attention_heatmap.py`
-can be reused verbatim (the block-diagonal chunk pattern shows up directly
-in the question-prefill frame-frame heatmap).
+record. Attention example saving is disabled by default
+(`--save_example_matrices 0`) because Test 5 defaults to `sdpa`; set
+`--attn_implementation eager --save_example_matrices N` to save heatmap
+payloads. Each saved attention example carries a `chunked_attention` dict
+with the same metadata, so `analysis/plot_vrag_attention_heatmap.py` can be
+reused verbatim (the block-diagonal chunk pattern shows up directly in the
+question-prefill frame-frame heatmap).
 
 V-RAG top-K + chunked attention test. `TOP_K` controls `--top_k_historical`
 and `CHUNK_SIZE` controls `--chunk_size`; both are interpolated into the
 result directory and log filename.
 
 ```bash
+# --max_samples_per_subset 50 \
 TOP_K=4
-CHUNK_SIZE=2
+CHUNK_SIZE=4
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
     --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
     --analysis_scope full \
     --recent_frames_only 4 \
-    --max_samples_per_subset 50 \
     --decode_max_frames "${DECODE_MAX_FRAMES}" \
     --top_k_historical "${TOP_K}" \
     --chunk_size "${CHUNK_SIZE}" \
@@ -694,14 +706,120 @@ CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test5.py
     > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
 ```
 
-Smoke run (1 sample per split):
+```bash
+# --max_samples_per_subset 50 \
+TOP_K=4
+CHUNK_SIZE=2
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+```
+
+```bash
+# --max_samples_per_subset 50 \
+TOP_K=4
+CHUNK_SIZE=1
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+```
+
+```bash
+# --max_samples_per_subset 50 \
+TOP_K=8
+CHUNK_SIZE=8
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+```
+
+```bash
+# --max_samples_per_subset 50 \
+TOP_K=8
+CHUNK_SIZE=2
+DECODE_MAX_FRAMES=128
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --analysis_scope full \
+    --recent_frames_only 4 \
+    --decode_max_frames "${DECODE_MAX_FRAMES}" \
+    --top_k_historical "${TOP_K}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --siglip_model_name google/siglip-so400m-patch14-384 \
+    --siglip_device auto \
+    --save_example_matrices 0 \
+    --attn_implementation sdpa \
+    --model_device auto \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+```
+
+Smoke run (1 sample per split). Because Test 5 uses arbitrary 4D masks,
+`flash_attention_2` is disabled for the text decoder; use 4 GPUs with
+`--model_device auto` for the 8B model on 24GB cards.
 
 ```bash
 TOP_K=4
 CHUNK_SIZE=2
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=0 python main_experiments/eval_qwen3vl_ovo_test5.py \
+CUDA_VISIBLE_DEVICES=4,5 python main_experiments/eval_qwen3vl_ovo_test5.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --analysis_scope smoke \
     --anno_path data/ovo_bench/ovo_bench_new.json \

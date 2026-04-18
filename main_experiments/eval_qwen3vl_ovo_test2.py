@@ -4,7 +4,7 @@ OVO-Bench SigLIP top-4 frame evaluation for Qwen3-VL.
 This script scores every decoded fps-sampled frame with SigLIP cosine
 similarity against the question, keeps the top-4 frames, reorders them
 temporally, and runs QA using Qwen3-VL. Video decoding follows qwen_vl_utils
-sampling and caps decoded frames at 768.
+sampling and caps decoded frames at ``--decode_max_frames`` (default 768).
 """
 
 from __future__ import annotations
@@ -57,7 +57,11 @@ EVAL_TASK_SET = frozenset([*EVAL_BACKWARD_TASKS, *REAL_TIME_TASKS])
 TOP_K_FRAMES = 4
 DECODE_MAX_FRAMES = 768
 CANDIDATE_FRAME_POLICY = "all_decoded_frames"
-ANALYSIS_SAMPLING_STRATEGY = "all_decoded_frames_qwen_cap768"
+ANALYSIS_SAMPLING_STRATEGY_PREFIX = "all_decoded_frames_qwen_cap"
+
+
+def format_analysis_sampling_strategy(decode_max_frames: int) -> str:
+    return f"{ANALYSIS_SAMPLING_STRATEGY_PREFIX}{int(decode_max_frames)}"
 
 
 def make_ovo_key(item: dict[str, Any]) -> str:
@@ -191,6 +195,7 @@ def decode_full_video_to_chunks(
     video_path: str,
     chunk_duration: float,
     fps: float,
+    decode_max_frames: int,
 ) -> tuple[list[Any], str]:
     saved_exact_recent = os.environ.pop("QWEN_EXACT_RECENT_DECODE", None)
     try:
@@ -199,7 +204,7 @@ def decode_full_video_to_chunks(
             chunk_duration=chunk_duration,
             fps=fps,
             recent_frames_only=None,
-            max_frames=DECODE_MAX_FRAMES,
+            max_frames=int(decode_max_frames),
         )
     finally:
         if saved_exact_recent is not None:
@@ -332,6 +337,7 @@ def evaluate_siglip_top4_backward_realtime(
     siglip_encoder: SiglipFrameEncoder,
     chunk_duration: float,
     fps: float,
+    decode_max_frames: int,
     recent_frames_only: int,
 ) -> dict[str, Any]:
     video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
@@ -346,6 +352,7 @@ def evaluate_siglip_top4_backward_realtime(
         video_path=video_path,
         chunk_duration=chunk_duration,
         fps=fps,
+        decode_max_frames=decode_max_frames,
     )
     if not chunks:
         raise ValueError(f"No chunks decoded from video: {video_path}")
@@ -355,7 +362,7 @@ def evaluate_siglip_top4_backward_realtime(
     del chunks
 
     analysis_frame_indices = list(range(num_sampled_frames))
-    analysis_sampling_strategy = ANALYSIS_SAMPLING_STRATEGY
+    analysis_sampling_strategy = format_analysis_sampling_strategy(decode_max_frames)
     if not analysis_frame_indices:
         raise ValueError(f"No analysis frames selected for video: {video_path}")
 
@@ -480,7 +487,21 @@ def main() -> None:
     )
     parser.add_argument("--chunk_duration", type=float, default=1.0)
     parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument(
+        "--decode_max_frames",
+        type=int,
+        default=DECODE_MAX_FRAMES,
+        help=(
+            "Maximum number of frames decoded for SigLIP top-4 selection. "
+            "SigLIP similarity is computed over all decoded frames. Default: 768."
+        ),
+    )
     parser.add_argument("--max_qa_tokens", type=int, default=256)
+    parser.add_argument(
+        "--attn_implementation",
+        default="flash_attention_2",
+        help="Attention backend for Qwen3-VL. Default: flash_attention_2.",
+    )
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384")
     parser.add_argument(
         "--siglip_device",
@@ -509,6 +530,8 @@ def main() -> None:
         raise ValueError("--max_samples_per_subset must be >= 1 when provided.")
     if args.max_samples_per_split is not None and args.max_samples_per_subset is not None:
         raise ValueError("Use either --max_samples_per_split or --max_samples_per_subset, not both.")
+    if args.decode_max_frames < 1:
+        raise ValueError("--decode_max_frames must be >= 1.")
 
     accelerator = Accelerator()
 
@@ -550,9 +573,10 @@ def main() -> None:
     accelerator.print(f"Processes: {accelerator.num_processes}")
     accelerator.print(
         f"Window: recent_frames_only={args.recent_frames_only}, "
-        f"decode_max_frames={DECODE_MAX_FRAMES}, "
+        f"decode_max_frames={args.decode_max_frames}, "
         f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
         f"top_k={TOP_K_FRAMES}, "
+        f"attn_implementation={args.attn_implementation}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
     )
     accelerator.print(f"Scope: {args.analysis_scope}")
@@ -570,6 +594,7 @@ def main() -> None:
         model_name=args.model_path,
         device="auto" if args.model_device == "auto" else accelerator.device,
         max_new_tokens=args.max_qa_tokens,
+        attn_implementation=args.attn_implementation,
     )
     siglip_encoder = SiglipFrameEncoder(
         model_name=args.siglip_model_name,
@@ -611,6 +636,7 @@ def main() -> None:
                         siglip_encoder=siglip_encoder,
                         chunk_duration=args.chunk_duration,
                         fps=args.fps,
+                        decode_max_frames=args.decode_max_frames,
                         recent_frames_only=args.recent_frames_only,
                     )
                 except Exception as exc:
@@ -641,12 +667,13 @@ def main() -> None:
             "result_dir": args.result_dir,
             "analysis_scope": args.analysis_scope,
             "recent_frames_only": args.recent_frames_only,
-            "decode_max_frames": DECODE_MAX_FRAMES,
+            "decode_max_frames": args.decode_max_frames,
             "candidate_frame_policy": CANDIDATE_FRAME_POLICY,
             "top_k": TOP_K_FRAMES,
             "chunk_duration": args.chunk_duration,
             "fps": args.fps,
             "max_qa_tokens": args.max_qa_tokens,
+            "attn_implementation": args.attn_implementation,
             "max_samples_per_split": split_sample_cap,
             "max_samples_per_subset": args.max_samples_per_subset,
             "seed": args.seed,
