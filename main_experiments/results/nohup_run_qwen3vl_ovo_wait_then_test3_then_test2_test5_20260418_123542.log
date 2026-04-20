@@ -1717,3 +1717,6 @@ nohup: ignoring input
   log=main_experiments/results/nohup_ovo_qwen3vl_vrag_top8_chunk2_20260418_123542.log
   result_dir=main_experiments/results/ovo_qwen3vl_vrag_top8_chunk2_20260418_123542
   pid=619737
+[2026-04-20 16:57:38] completed test5 TOP_K=4 CHUNK_SIZE=1 on GPU 4,5; elapsed 07:58:35
+[2026-04-20 16:57:38] GPU 4,5 queue completed
+[2026-04-20 16:57:38] GPU 4,5 queue exit status 0
