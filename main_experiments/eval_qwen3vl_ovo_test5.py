@@ -141,6 +141,115 @@ def assign_frame_chunks(
     return chunk_id_per_frame, retrieved_chunk_sizes, recent_chunk_id
 
 
+def build_per_chunk_position_ids(
+    *,
+    position_ids: torch.Tensor,
+    frame_token_spans: list[tuple[int, int]],
+    chunk_id_per_frame: list[int],
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-number mRoPE ``position_ids`` so each frame chunk starts at the same base.
+
+    The goal is PCW-style positional encoding: every frame chunk sees mRoPE
+    coordinates as if it were the only video input. Concretely, each chunk's
+    first frame token is shifted to land on ``position_ids[:, 0, image_token_start]``
+    (the original position of the first frame's first token), preserving the
+    chunk's internal relative offsets. Non-frame tokens (system prompt,
+    ``<vision_start>``) keep their original positions; post-frame tokens
+    (``<vision_end>``, question, assistant prompt) are shifted to start right
+    after the max position produced by any chunk.
+
+    ``rope_deltas`` is recomputed as ``new_max_position + 1 - seq_len`` to
+    match HF's convention so the decode-step position calculation in
+    ``Qwen3VLModel.forward`` (modeling_qwen3_vl.py:1266) continues to line up.
+
+    Inputs:
+      position_ids: original mRoPE position_ids of shape ``[3, 1, seq_len]``.
+      frame_token_spans: per-frame ``(start, end_exclusive)`` token ranges,
+        aligned with ``chunk_id_per_frame``.
+      chunk_id_per_frame: chunk assignment per frame, from ``assign_frame_chunks``.
+      seq_len: total prefill sequence length.
+    """
+    if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+        raise ValueError(
+            f"Expected mRoPE position_ids of shape [3, 1, seq_len], got {tuple(position_ids.shape)}"
+        )
+    if len(frame_token_spans) != len(chunk_id_per_frame):
+        raise ValueError(
+            "frame_token_spans and chunk_id_per_frame must have the same length: "
+            f"{len(frame_token_spans)} vs {len(chunk_id_per_frame)}"
+        )
+    if not frame_token_spans:
+        new_max = int(position_ids.max().item())
+        new_rope_deltas = torch.tensor(
+            [[new_max + 1 - int(seq_len)]],
+            dtype=torch.long,
+            device=position_ids.device,
+        )
+        return position_ids.clone(), new_rope_deltas
+
+    device = position_ids.device
+    new_position_ids = position_ids.clone()
+
+    image_token_start = int(frame_token_spans[0][0])
+    p_start = position_ids[:, 0, image_token_start].clone()  # shape [3]
+
+    chunk_to_range: dict[int, tuple[int, int]] = {}
+    for (span_start, span_end), chunk_id in zip(frame_token_spans, chunk_id_per_frame):
+        span_start = int(span_start)
+        span_end = int(span_end)
+        if chunk_id in chunk_to_range:
+            existing_start, existing_end = chunk_to_range[chunk_id]
+            chunk_to_range[chunk_id] = (
+                min(existing_start, span_start),
+                max(existing_end, span_end),
+            )
+        else:
+            chunk_to_range[chunk_id] = (span_start, span_end)
+
+    # Sanity: the union of chunk ranges must cover exactly
+    # [image_token_start, last_frame_end) with no gaps and no overlaps, because
+    # combined_frame_indices is temporally sorted and chunks are contiguous.
+    sorted_ranges = sorted(chunk_to_range.values(), key=lambda pair: pair[0])
+    prev_end = sorted_ranges[0][0]
+    for start, end in sorted_ranges:
+        if start != prev_end:
+            raise ValueError(
+                "Chunks are expected to form a contiguous frame-token range, "
+                f"but found gap/overlap at start={start} prev_end={prev_end}"
+            )
+        prev_end = end
+
+    max_new_pos = int(position_ids[:, 0, :image_token_start].max().item())
+    for chunk_start, chunk_end in sorted_ranges:
+        chunk_first_pos = position_ids[:, 0, chunk_start]  # [3]
+        shift_per_dim = (chunk_first_pos - p_start).view(3, 1)  # [3, 1]
+        new_position_ids[:, 0, chunk_start:chunk_end] = (
+            position_ids[:, 0, chunk_start:chunk_end] - shift_per_dim
+        )
+        chunk_max = int(new_position_ids[:, 0, chunk_start:chunk_end].max().item())
+        if chunk_max > max_new_pos:
+            max_new_pos = chunk_max
+
+    last_frame_end = int(frame_token_spans[-1][1])
+    if last_frame_end < int(seq_len):
+        orig_post_first = int(position_ids[:, 0, last_frame_end].max().item())
+        new_post_first = max_new_pos + 1
+        shift_post = orig_post_first - new_post_first
+        if shift_post != 0:
+            new_position_ids[:, 0, last_frame_end:] = (
+                position_ids[:, 0, last_frame_end:] - shift_post
+            )
+
+    new_max = int(new_position_ids.max().item())
+    new_rope_deltas = torch.tensor(
+        [[new_max + 1 - int(seq_len)]],
+        dtype=torch.long,
+        device=device,
+    )
+    return new_position_ids, new_rope_deltas
+
+
 def build_chunked_attention_mask_4d(
     *,
     seq_len: int,
@@ -658,6 +767,7 @@ def generate_with_chunked_attention(
     recent_index_set: set[int],
     chunk_size: int,
     prompt: str,
+    reset_chunk_position_ids: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Run Qwen3-VL generation with chunked attention over frame tokens.
 
@@ -691,6 +801,16 @@ def generate_with_chunked_attention(
             dtype=inputs_embeds.dtype,
             device=inputs_embeds.device,
         )
+
+        if reset_chunk_position_ids:
+            new_position_ids, new_rope_deltas = build_per_chunk_position_ids(
+                position_ids=inputs["position_ids"],
+                frame_token_spans=frame_token_spans,
+                chunk_id_per_frame=chunk_id_per_frame,
+                seq_len=int(inputs_embeds.shape[1]),
+            )
+            inputs["position_ids"] = new_position_ids
+            inputs["rope_deltas"] = new_rope_deltas
 
         # The analyzer normally sets these inside ``generate_from_frames``. Because
         # we bypass the chat-template path, set them manually so downstream fields
@@ -726,6 +846,7 @@ def capture_question_prefill_attention_maps(
     recent_index_set: set[int],
     chunk_size: int,
     question_text: str,
+    reset_chunk_position_ids: bool = False,
 ) -> dict[str, Any] | None:
     if not combined_frames or not question_text:
         return None
@@ -780,6 +901,15 @@ def capture_question_prefill_attention_maps(
             device=inputs_embeds_q.device,
         )
 
+        position_ids_q = question_only_inputs["position_ids"]
+        if reset_chunk_position_ids:
+            position_ids_q, _ = build_per_chunk_position_ids(
+                position_ids=position_ids_q,
+                frame_token_spans=question_only_inputs["frame_token_spans"],
+                chunk_id_per_frame=chunk_id_per_frame,
+                seq_len=int(inputs_embeds_q.shape[1]),
+            )
+
         with chunked_causal_mask_override(chunked_mask_4d):
             prefill_output = qa._run_with_collector(
                 collector,
@@ -787,7 +917,7 @@ def capture_question_prefill_attention_maps(
                 input_ids=None,
                 inputs_embeds=inputs_embeds_q,
                 attention_mask=question_only_inputs["attention_mask"],
-                position_ids=question_only_inputs["position_ids"],
+                position_ids=position_ids_q,
             )
         del prefill_output
         prefill_output = None
@@ -866,6 +996,7 @@ def evaluate_vrag_top5_backward_realtime(
     recent_frames_only: int,
     top_k_historical: int,
     chunk_size: int,
+    reset_chunk_position_ids: bool = False,
     examples_dir: Path | None = None,
     save_example: bool = False,
 ) -> dict[str, Any]:
@@ -954,6 +1085,7 @@ def evaluate_vrag_top5_backward_realtime(
         recent_index_set=recent_index_set,
         chunk_size=chunk_size,
         prompt=prompt,
+        reset_chunk_position_ids=reset_chunk_position_ids,
     )
     generate_time = time.perf_counter() - t0
     release_cuda_cache()
@@ -970,6 +1102,7 @@ def evaluate_vrag_top5_backward_realtime(
                 recent_index_set=recent_index_set,
                 chunk_size=chunk_size,
                 question_text=similarity_text,
+                reset_chunk_position_ids=reset_chunk_position_ids,
             )
             if attention_payload is not None:
                 key = make_ovo_key(anno)
@@ -1137,6 +1270,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reset_chunk_position_ids",
+        action="store_true",
+        help=(
+            "PCW-style positional encoding: each frame chunk receives mRoPE coordinates "
+            "as if it were the only video input. All chunks (retrieved and recent) share "
+            "the same base position, and question/assistant tokens shift to start right "
+            "after the longest chunk's max position. rope_deltas is recomputed so the "
+            "decode step continues correctly. Default: off (standard whole-sequence mRoPE)."
+        ),
+    )
+    parser.add_argument(
         "--save_example_matrices",
         type=int,
         default=0,
@@ -1238,6 +1382,7 @@ def main() -> None:
         f"candidate_frame_policy={CANDIDATE_FRAME_POLICY}, "
         f"top_k_historical={int(args.top_k_historical)}, "
         f"chunk_size={int(args.chunk_size)}, "
+        f"reset_chunk_position_ids={bool(args.reset_chunk_position_ids)}, "
         f"text_attn_implementation={args.attn_implementation}, "
         f"vision_attn_implementation={VISION_ATTN_IMPLEMENTATION}, "
         f"chunk_duration={args.chunk_duration}, fps={args.fps}"
@@ -1318,6 +1463,7 @@ def main() -> None:
                         recent_frames_only=args.recent_frames_only,
                         top_k_historical=args.top_k_historical,
                         chunk_size=args.chunk_size,
+                        reset_chunk_position_ids=args.reset_chunk_position_ids,
                         examples_dir=examples_dir,
                         save_example=save_example,
                     )
@@ -1353,6 +1499,7 @@ def main() -> None:
             "candidate_frame_policy": CANDIDATE_FRAME_POLICY,
             "top_k_historical": int(args.top_k_historical),
             "chunk_size": int(args.chunk_size),
+            "reset_chunk_position_ids": bool(args.reset_chunk_position_ids),
             "chunk_duration": args.chunk_duration,
             "fps": args.fps,
             "max_qa_tokens": args.max_qa_tokens,
