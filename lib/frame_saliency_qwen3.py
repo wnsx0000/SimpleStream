@@ -512,12 +512,18 @@ class LayerwiseFrameAttentionCollector:
     save_raw: bool = False
     map_layer_indices: list[int] | None = None
     question_prefill_map_metadata: QuestionPrefillAttentionMapMetadata | None = None
+    capture_per_patch: bool = False
+    value_head_dim: int | None = None
+    value_num_kv_heads: int | None = None
 
     def __post_init__(self) -> None:
         self.layer_scores: list[torch.Tensor | None] = [None] * self.num_layers
         self.layer_raw_attentions: dict[int, torch.Tensor] = {}
         self.map_layer_index_set = set(int(index) for index in (self.map_layer_indices or []))
         self.layer_attention_maps: dict[int, dict[str, torch.Tensor]] = {}
+        # Per-display-layer per-frame per-patch attention vectors and per-frame V-norms.
+        self.layer_per_patch_attention: dict[int, list[torch.Tensor]] = {}
+        self.layer_value_norms: dict[int, torch.Tensor] = {}
 
     def make_hook(self, layer_idx: int):
         def hook(_module: Any, _inputs: Any, output: Any):
@@ -548,6 +554,15 @@ class LayerwiseFrameAttentionCollector:
             stacked = torch.stack(frame_scores, dim=-1)
             self.layer_scores[layer_idx] = stacked.mean(dim=1).mean(dim=0).detach().float().cpu()
 
+            if self.capture_per_patch and layer_idx in self.map_layer_index_set:
+                # selected shape: [heads, num_question_tokens, seq_len]. Mean over heads
+                # and question-token positions yields one attention vector per frame span.
+                pooled = selected.float().mean(dim=0).mean(dim=0)
+                per_frame_vectors: list[torch.Tensor] = []
+                for start, end in self.frame_token_spans:
+                    per_frame_vectors.append(pooled[start:end].detach().cpu())
+                self.layer_per_patch_attention[layer_idx] = per_frame_vectors
+
             if self.save_raw:
                 self.layer_raw_attentions[layer_idx] = attn_weights[0].detach().float().cpu()
 
@@ -555,6 +570,34 @@ class LayerwiseFrameAttentionCollector:
             # immediately free the large [batch, heads, seq_len, seq_len] GPU tensor
             # instead of keeping it alive through the rest of the decoder layer.
             return (output[0], None) + output[2:] if len(output) > 2 else (output[0], None)
+
+        return hook
+
+    def make_value_hook(self, layer_idx: int, head_dim: int, num_kv_heads: int):
+        def hook(_module: Any, _inputs: Any, output: Any):
+            value_tensor = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(value_tensor, torch.Tensor):
+                raise RuntimeError(
+                    f"v_proj forward output for layer {layer_idx} is not a tensor: {type(value_tensor)}"
+                )
+            if value_tensor.ndim != 3:
+                raise RuntimeError(
+                    f"Unexpected v_proj output shape at layer {layer_idx}: {tuple(value_tensor.shape)}"
+                )
+            seq_len = int(value_tensor.shape[1])
+            expected_dim = int(head_dim) * int(num_kv_heads)
+            if int(value_tensor.shape[-1]) != expected_dim:
+                raise RuntimeError(
+                    f"v_proj output last dim {int(value_tensor.shape[-1])} does not match "
+                    f"head_dim*num_kv_heads={expected_dim} at layer {layer_idx}"
+                )
+            reshaped = value_tensor.float().view(1, seq_len, int(num_kv_heads), int(head_dim))
+            # L2 norm per head over head_dim, mean across heads -> [seq_len].
+            per_token_norm = reshaped.norm(dim=-1).mean(dim=-1).squeeze(0)
+            per_frame_means = []
+            for start, end in self.frame_token_spans:
+                per_frame_means.append(per_token_norm[start:end].mean())
+            self.layer_value_norms[layer_idx] = torch.stack(per_frame_means, dim=0).detach().cpu()
 
         return hook
 
@@ -1068,8 +1111,26 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
     ) -> Any:
         handles = []
         if collector is not None:
-            for layer_idx, layer in enumerate(self._get_text_layers()):
+            text_layers = self._get_text_layers()
+            for layer_idx, layer in enumerate(text_layers):
                 handles.append(layer.self_attn.register_forward_hook(collector.make_hook(layer_idx)))
+            if collector.capture_per_patch and collector.value_head_dim and collector.value_num_kv_heads:
+                for layer_idx in collector.map_layer_index_set:
+                    if layer_idx < 0 or layer_idx >= len(text_layers):
+                        continue
+                    self_attn = text_layers[layer_idx].self_attn
+                    v_proj = getattr(self_attn, "v_proj", None)
+                    if v_proj is None:
+                        continue
+                    handles.append(
+                        v_proj.register_forward_hook(
+                            collector.make_value_hook(
+                                layer_idx,
+                                head_dim=int(collector.value_head_dim),
+                                num_kv_heads=int(collector.value_num_kv_heads),
+                            )
+                        )
+                    )
         try:
             return self.model(
                 use_cache=use_cache,
@@ -1185,6 +1246,11 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     if save_example_matrices
                     else None
                 )
+                value_head_dim, value_num_kv_heads = (None, None)
+                if save_example_matrices and text_layers:
+                    sample_attn = getattr(text_layers[0], "self_attn", None)
+                    value_head_dim = getattr(sample_attn, "head_dim", None)
+                    value_num_kv_heads = getattr(sample_attn, "num_key_value_heads", None)
                 prefill_collector = LayerwiseFrameAttentionCollector(
                     frame_token_spans=question_only_inputs["frame_token_spans"],
                     query_positions=question_only_inputs["question_token_positions"],
@@ -1196,6 +1262,9 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                         else None
                     ),
                     question_prefill_map_metadata=map_metadata,
+                    capture_per_patch=bool(save_example_matrices),
+                    value_head_dim=int(value_head_dim) if value_head_dim is not None else None,
+                    value_num_kv_heads=int(value_num_kv_heads) if value_num_kv_heads is not None else None,
                 )
                 _prefill_output = self._run_with_collector(
                     prefill_collector,
@@ -1227,6 +1296,51 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     )
                     if sink_bin_token_payload is not None:
                         example_payload["question_prefill_sink_bin_token_attention"] = sink_bin_token_payload
+
+                    # Persist analysis-frame raw images, patch grid, per-patch attention,
+                    # and per-frame V-norms so the offline plotter can render attention
+                    # overlays and value-norm bar panels.
+                    grid_rows = attention_grid.detach().cpu().to(torch.long)
+                    patch_grids: list[tuple[int, int]] = []
+                    for row in grid_rows:
+                        _t, h_grid, w_grid = (int(value) for value in row.tolist())
+                        patch_h = max(1, h_grid // max(1, int(self.merge_size)))
+                        patch_w = max(1, w_grid // max(1, int(self.merge_size)))
+                        patch_grids.append((patch_h, patch_w))
+                    example_payload["analysis_frame_patch_grids"] = patch_grids
+                    example_payload["analysis_frame_indices"] = list(attention_frame_indices)
+                    example_payload["analysis_frames"] = [
+                        np.asarray(frames[frame_idx].convert("RGB"), dtype=np.uint8)
+                        for frame_idx in attention_frame_indices
+                    ]
+
+                    per_patch_payload: dict[int, list[torch.Tensor]] = {}
+                    for layer_idx in display_layer_indices:
+                        per_frame_vectors = prefill_collector.layer_per_patch_attention.get(int(layer_idx))
+                        if per_frame_vectors is None or len(per_frame_vectors) != len(patch_grids):
+                            continue
+                        reshaped: list[torch.Tensor] = []
+                        for vector, (patch_h, patch_w) in zip(per_frame_vectors, patch_grids):
+                            expected = patch_h * patch_w
+                            if vector.numel() != expected:
+                                # Skip mismatched frames silently; plotter falls back to 1D view.
+                                reshaped.append(vector.detach().cpu())
+                                continue
+                            reshaped.append(vector.detach().cpu().reshape(patch_h, patch_w))
+                        per_patch_payload[int(layer_idx)] = reshaped
+                    if per_patch_payload:
+                        example_payload["question_prefill_per_patch_attention"] = per_patch_payload
+
+                    value_norm_rows: list[torch.Tensor] = []
+                    have_value_norms = True
+                    for layer_idx in display_layer_indices:
+                        row = prefill_collector.layer_value_norms.get(int(layer_idx))
+                        if row is None:
+                            have_value_norms = False
+                            break
+                        value_norm_rows.append(row)
+                    if have_value_norms and value_norm_rows:
+                        example_payload["question_prefill_value_norms"] = torch.stack(value_norm_rows, dim=0)
                 if save_raw_attentions:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["raw_question_prefill_attentions"] = {

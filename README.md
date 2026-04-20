@@ -233,6 +233,23 @@ The pooled `plots/` directory additionally includes
 `question_prefill_frame_frame_maps_average.png` and
 `question_prefill_question_frame_maps_average.png`, averaged over the saved
 example subset only.
+Each saved example also produces 12 per-layer attention overlay figures
+(`question_prefill_attention_overlay_layer{N}.png`, one per display layer)
+where each panel shows an analysis frame in the background with that layer's
+per-patch question-prefill attention heatmap (`magma`, `alpha=0.55`,
+nearest-neighbor) drawn on top, aligned to the Qwen3-VL spatial-merged patch
+grid. A companion `question_prefill_value_norms.png` renders a 3×4 grid of
+12 layer panels of bar charts whose x-axis bins and tick labels mirror
+`question_prefill_frame_frame_maps.png`, with y = mean L2 norm of the V
+projection (per-token L2 norm averaged over key-value heads, then averaged
+within each frame bin); recent frames are highlighted in red. To support
+these renderings, the example payload now additionally stores
+`analysis_frames` (per-frame uint8 RGB arrays for the analysis subset),
+`analysis_frame_indices`, `analysis_frame_patch_grids` (per-frame
+`(H′, W′)`), `question_prefill_per_patch_attention` (per display layer →
+list of `(H′, W′)` tensors), and `question_prefill_value_norms` (shape
+`[len(display_layers), num_analysis_frames]`). The plotter falls back to
+"skipping …" messages for older result directories that lack these keys.
 The SigLIP similarity test (test1-1) decodes the full video at `--fps 1.0`
 with the same `qwen_vl_utils` sampling policy used by Test 2, capped at
 `--max_analysis_frames` frames (default 768). Videos longer than this cap are

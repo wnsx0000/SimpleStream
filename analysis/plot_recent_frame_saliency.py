@@ -691,6 +691,155 @@ def plot_question_prefill_attention_map_averages(payloads: list[dict[str, Any]],
         )
 
 
+def render_per_layer_attention_overlay(
+    frames: list[np.ndarray],
+    per_frame_attention: list[np.ndarray],
+    layer_idx: int,
+    output_path: Path,
+    *,
+    figure_title: str,
+    frame_indices: list[int] | None = None,
+    recent_frame_indices: list[int] | None = None,
+) -> None:
+    if not frames or not per_frame_attention:
+        return
+    num_panels = min(len(frames), len(per_frame_attention))
+    if num_panels < 1:
+        return
+    max_cols = 4
+    num_cols = min(num_panels, max_cols)
+    num_rows = (num_panels + max_cols - 1) // max_cols
+    panel_width = 4.6
+    panel_height = panel_width
+    fig, axes = plt.subplots(
+        num_rows, num_cols,
+        figsize=(panel_width * num_cols, panel_height * num_rows + 1.0),
+        squeeze=False,
+    )
+
+    finite_values = np.concatenate([
+        np.asarray(matrix, dtype=np.float64).ravel()
+        for matrix in per_frame_attention[:num_panels]
+        if np.asarray(matrix).size > 0
+    ]) if per_frame_attention else np.empty(0, dtype=np.float64)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    norm = build_emphasized_heatmap_norm(finite_values)
+    recent_set = {int(idx) for idx in (recent_frame_indices or [])}
+
+    mappable = None
+    for panel_idx in range(num_panels):
+        row_idx, col_idx = divmod(panel_idx, max_cols)
+        ax = axes[row_idx][col_idx]
+        frame_image = np.asarray(frames[panel_idx])
+        if frame_image.ndim != 3 or frame_image.shape[-1] not in (3, 4):
+            ax.set_visible(False)
+            continue
+        image_h, image_w = int(frame_image.shape[0]), int(frame_image.shape[1])
+        ax.imshow(frame_image)
+
+        attention_matrix = np.asarray(per_frame_attention[panel_idx], dtype=np.float32)
+        if attention_matrix.ndim == 2 and attention_matrix.size > 0:
+            mappable = ax.imshow(
+                attention_matrix,
+                extent=(-0.5, image_w - 0.5, image_h - 0.5, -0.5),
+                cmap="magma",
+                norm=norm,
+                alpha=0.55,
+                interpolation="nearest",
+            )
+        ax.set_xlim(-0.5, image_w - 0.5)
+        ax.set_ylim(image_h - 0.5, -0.5)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        title_parts: list[str] = []
+        if frame_indices is not None and panel_idx < len(frame_indices):
+            absolute_idx = int(frame_indices[panel_idx])
+            tag = "*" if absolute_idx in recent_set else ""
+            title_parts.append(f"frame {absolute_idx}{tag}")
+        else:
+            title_parts.append(f"panel {panel_idx}")
+        ax.set_title(" ".join(title_parts), fontsize=9)
+
+    for col_idx in range(num_panels % max_cols or max_cols, max_cols):
+        if num_rows > 1 or num_panels < max_cols:
+            last_row = num_rows - 1
+            if last_row < axes.shape[0] and col_idx < axes.shape[1]:
+                axes[last_row][col_idx].set_visible(False)
+
+    fig.suptitle(figure_title, y=0.98)
+    fig.subplots_adjust(left=0.04, right=0.90, top=0.92, bottom=0.06, wspace=0.10, hspace=0.20)
+    if mappable is not None:
+        cbar_ax = fig.add_axes([0.92, 0.10, 0.012, 0.80])
+        fig.colorbar(mappable, cax=cbar_ax, label=f"Layer {int(layer_idx)} Mean Attention")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def render_value_norm_bar_panels(
+    value_norms: np.ndarray,
+    display_layer_indices: list[int],
+    output_path: Path,
+    *,
+    figure_title: str,
+    frame_bin_slices: list[list[int]] | list[tuple[int, int]],
+    frame_bin_labels: list[str],
+    recent_frame_indices_within_attention: list[int] | None = None,
+) -> None:
+    value_norms = np.asarray(value_norms, dtype=np.float32)
+    if value_norms.ndim != 2 or value_norms.shape[0] < 1 or value_norms.shape[1] < 1:
+        return
+    if not frame_bin_slices or len(frame_bin_slices) != value_norms.shape[1]:
+        return
+
+    num_panels = value_norms.shape[0]
+    max_cols = 4
+    num_cols = min(num_panels, max_cols)
+    num_rows = (num_panels + max_cols - 1) // max_cols
+    panel_width = 4.6
+    panel_height = panel_width
+    fig, axes = plt.subplots(
+        num_rows, num_cols,
+        figsize=(panel_width * num_cols, panel_height * num_rows + 1.0),
+        squeeze=False,
+    )
+
+    centers = frame_slice_centers(frame_bin_slices)
+    widths = np.asarray(
+        [max(1, int(end) - int(start)) for start, end in frame_bin_slices],
+        dtype=np.float64,
+    )
+    total_bins = int(frame_bin_slices[-1][1])
+    recent_set = {int(idx) for idx in (recent_frame_indices_within_attention or [])}
+
+    for panel_idx in range(num_panels):
+        row_idx, col_idx = divmod(panel_idx, max_cols)
+        ax = axes[row_idx][col_idx]
+        layer_values = value_norms[panel_idx]
+        bar_colors = [
+            "#cb181d" if frame_idx in recent_set else "#4f81bd"
+            for frame_idx in range(layer_values.shape[0])
+        ]
+        ax.bar(centers, layer_values, width=widths, align="center", color=bar_colors, edgecolor="white", linewidth=0.4)
+        ax.set_xlim(-0.5, total_bins - 0.5)
+        annotate_frame_boundaries(ax, frame_bin_slices, draw_x=True, draw_y=False)
+        apply_frame_ticks(ax, frame_bin_slices, frame_bin_labels, axis="x")
+        ax.set_title(f"Layer {int(display_layer_indices[panel_idx])}")
+        ax.set_xlabel("Frame Index")
+        if col_idx == 0:
+            ax.set_ylabel("Mean V Norm")
+
+    for col_idx in range(num_panels % max_cols or max_cols, max_cols):
+        if num_rows > 1 or num_panels < max_cols:
+            last_row = num_rows - 1
+            if last_row < axes.shape[0] and col_idx < axes.shape[1]:
+                axes[last_row][col_idx].set_visible(False)
+
+    fig.suptitle(figure_title, y=0.98)
+    fig.subplots_adjust(left=0.06, right=0.97, top=0.92, bottom=0.10, wspace=0.30, hspace=0.55)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str, Any] | None = None) -> None:
     payload = torch.load(example_path, map_location="cpu") if payload is None else payload
     if str(payload.get("task", "")) in EXCLUDED_PLOT_TASKS:
@@ -783,6 +932,70 @@ def plot_example_payload(example_path: Path, plots_dir: Path, payload: dict[str,
                 frame_bin_slices=frame_bin_slices,
                 frame_bin_labels=frame_bin_labels,
                 question_bin_labels=question_bin_labels,
+            )
+
+        analysis_frames = payload.get("analysis_frames")
+        per_patch_attention = payload.get("question_prefill_per_patch_attention")
+        analysis_frame_indices_payload = payload.get("analysis_frame_indices")
+        recent_attention_indices = (
+            payload.get("metrics", {})
+            .get("question_prefill_attention", {})
+            .get("recent_frame_indices_within_attention", [])
+        )
+        recent_absolute_indices: list[int] = []
+        if analysis_frame_indices_payload is not None and recent_attention_indices:
+            for local_idx in recent_attention_indices:
+                local_idx = int(local_idx)
+                if 0 <= local_idx < len(analysis_frame_indices_payload):
+                    recent_absolute_indices.append(int(analysis_frame_indices_payload[local_idx]))
+        if analysis_frames and isinstance(per_patch_attention, dict) and display_layer_indices:
+            frame_arrays = [np.asarray(frame) for frame in analysis_frames]
+            absolute_frame_indices = (
+                [int(idx) for idx in analysis_frame_indices_payload]
+                if analysis_frame_indices_payload is not None
+                else list(range(len(frame_arrays)))
+            )
+            for layer_idx in display_layer_indices:
+                per_frame_tensors = per_patch_attention.get(int(layer_idx))
+                if not per_frame_tensors:
+                    continue
+                per_frame_arrays = [
+                    np.asarray(to_numpy_array(matrix), dtype=np.float32)
+                    for matrix in per_frame_tensors
+                ]
+                render_per_layer_attention_overlay(
+                    frame_arrays,
+                    per_frame_arrays,
+                    int(layer_idx),
+                    example_dir / f"question_prefill_attention_overlay_layer{int(layer_idx)}.png",
+                    figure_title=(
+                        f"Question Prefill Attention Overlay (Layer {int(layer_idx)}): {example_label}"
+                    ),
+                    frame_indices=absolute_frame_indices,
+                    recent_frame_indices=recent_absolute_indices,
+                )
+        elif display_layer_indices and (analysis_frames is None or per_patch_attention is None):
+            print(
+                f"Skipping per-layer attention overlay for {example_key}: "
+                "saved example payload is missing analysis_frames or "
+                "question_prefill_per_patch_attention."
+            )
+
+        value_norms = to_numpy_array(payload.get("question_prefill_value_norms"))
+        if value_norms is not None and value_norms.ndim == 2 and display_layer_indices:
+            render_value_norm_bar_panels(
+                value_norms,
+                display_layer_indices,
+                example_dir / "question_prefill_value_norms.png",
+                figure_title=f"Question Prefill V-Norms: {example_label}",
+                frame_bin_slices=frame_bin_slices,
+                frame_bin_labels=frame_bin_labels,
+                recent_frame_indices_within_attention=recent_attention_indices,
+            )
+        elif display_layer_indices and value_norms is None:
+            print(
+                f"Skipping value-norm bar panels for {example_key}: "
+                "saved example payload is missing question_prefill_value_norms."
             )
 
     sink_payload = question_prefill_sink_bin_token_payload(payload)
