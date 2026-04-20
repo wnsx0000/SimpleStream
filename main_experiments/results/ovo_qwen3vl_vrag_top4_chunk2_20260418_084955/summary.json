@@ -1,0 +1,193 @@
+{
+  "config": {
+    "generated_at": "2026-04-18T18:53:11.961014",
+    "model_label": "Qwen3-VL-V-RAG-Top4-Chunk2",
+    "model_path": "Qwen/Qwen3-VL-8B-Instruct",
+    "siglip_model_name": "google/siglip-so400m-patch14-384",
+    "siglip_device": "auto",
+    "resolved_siglip_device": "cuda:0",
+    "anno_path": "data/ovo_bench/ovo_bench_new.json",
+    "chunked_dir": "data/ovo_bench/chunked_videos",
+    "result_dir": "main_experiments/results/ovo_qwen3vl_vrag_top4_chunk2_20260418_084955",
+    "analysis_scope": "full",
+    "recent_frames_only": 4,
+    "decode_max_frames": 128,
+    "candidate_frame_policy": "non_recent_frames",
+    "top_k_historical": 4,
+    "chunk_size": 2,
+    "chunk_duration": 1.0,
+    "fps": 1.0,
+    "max_qa_tokens": 256,
+    "save_example_matrices": 0,
+    "attn_implementation": "sdpa",
+    "vision_attn_implementation": "flash_attention_2",
+    "model_device": "auto",
+    "max_samples_per_split": null,
+    "max_samples_per_subset": null,
+    "seed": 42,
+    "excluded_backward_tasks": [
+      "HLD"
+    ],
+    "excluded_forward_tasks": [
+      "REC",
+      "SSR",
+      "CRR"
+    ],
+    "sampling_counts": {
+      "backward": {
+        "available": {
+          "EPM": 297,
+          "ASI": 148
+        },
+        "selected": {
+          "EPM": 297,
+          "ASI": 148
+        }
+      },
+      "realtime": {
+        "available": {
+          "OCR": 149,
+          "ACR": 109,
+          "ATR": 116,
+          "STU": 178,
+          "FPD": 101,
+          "OJR": 184
+        },
+        "selected": {
+          "OCR": 149,
+          "ACR": 109,
+          "ATR": 116,
+          "STU": 178,
+          "FPD": 101,
+          "OJR": 184
+        }
+      }
+    }
+  },
+  "splits": {
+    "backward": {
+      "title": "Backward Tracing",
+      "subset_accuracy_list": [
+        {
+          "task": "EPM",
+          "correct": 175,
+          "total": 297,
+          "accuracy": 58.92255892255892
+        },
+        {
+          "task": "ASI",
+          "correct": 82,
+          "total": 148,
+          "accuracy": 55.4054054054054
+        }
+      ],
+      "subsets": {
+        "EPM": {
+          "task": "EPM",
+          "correct": 175,
+          "total": 297,
+          "accuracy": 58.92255892255892
+        },
+        "ASI": {
+          "task": "ASI",
+          "correct": 82,
+          "total": 148,
+          "accuracy": 55.4054054054054
+        }
+      },
+      "official_split_avg": 57.16398216398216,
+      "pooled_accuracy": 57.752808988764045,
+      "correct": 257,
+      "total": 445
+    },
+    "realtime": {
+      "title": "Real-time Perception",
+      "subset_accuracy_list": [
+        {
+          "task": "OCR",
+          "correct": 133,
+          "total": 149,
+          "accuracy": 89.26174496644295
+        },
+        {
+          "task": "ACR",
+          "correct": 84,
+          "total": 109,
+          "accuracy": 77.06422018348624
+        },
+        {
+          "task": "ATR",
+          "correct": 96,
+          "total": 116,
+          "accuracy": 82.75862068965517
+        },
+        {
+          "task": "STU",
+          "correct": 116,
+          "total": 178,
+          "accuracy": 65.1685393258427
+        },
+        {
+          "task": "FPD",
+          "correct": 76,
+          "total": 101,
+          "accuracy": 75.24752475247524
+        },
+        {
+          "task": "OJR",
+          "correct": 137,
+          "total": 184,
+          "accuracy": 74.45652173913044
+        }
+      ],
+      "subsets": {
+        "OCR": {
+          "task": "OCR",
+          "correct": 133,
+          "total": 149,
+          "accuracy": 89.26174496644295
+        },
+        "ACR": {
+          "task": "ACR",
+          "correct": 84,
+          "total": 109,
+          "accuracy": 77.06422018348624
+        },
+        "ATR": {
+          "task": "ATR",
+          "correct": 96,
+          "total": 116,
+          "accuracy": 82.75862068965517
+        },
+        "STU": {
+          "task": "STU",
+          "correct": 116,
+          "total": 178,
+          "accuracy": 65.1685393258427
+        },
+        "FPD": {
+          "task": "FPD",
+          "correct": 76,
+          "total": 101,
+          "accuracy": 75.24752475247524
+        },
+        "OJR": {
+          "task": "OJR",
+          "correct": 137,
+          "total": 184,
+          "accuracy": 74.45652173913044
+        }
+      },
+      "official_split_avg": 77.32619527617211,
+      "pooled_accuracy": 76.70250896057348,
+      "correct": 642,
+      "total": 837
+    }
+  },
+  "overall": {
+    "official_total_avg": 67.24508872007713,
+    "pooled_overall_accuracy": 70.12480499219969,
+    "correct": 899,
+    "total": 1282
+  }
+}

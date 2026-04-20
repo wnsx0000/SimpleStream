@@ -376,7 +376,7 @@ excluded.
 
 ```bash
 python analysis/plot_siglip_top4_selection.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_20260416_141554_always_recent4
+    --result-dir main_experiments/results/ovo_qwen3vl_siglip_top4_all_decoded_cap128_20260418_123542
 ```
 </details>
 

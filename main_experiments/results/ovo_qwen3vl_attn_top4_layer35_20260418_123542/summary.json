@@ -1,0 +1,186 @@
+{
+  "config": {
+    "generated_at": "2026-04-19T19:47:48.038312",
+    "model_label": "Qwen3-VL-Attn-Top4",
+    "model_path": "Qwen/Qwen3-VL-8B-Instruct",
+    "anno_path": "data/ovo_bench/ovo_bench_new.json",
+    "chunked_dir": "data/ovo_bench/chunked_videos",
+    "result_dir": "main_experiments/results/ovo_qwen3vl_attn_top4_layer35_20260418_123542",
+    "analysis_scope": "full",
+    "recent_frames_only": 4,
+    "max_analysis_frames": 12,
+    "top_k": 4,
+    "layer_number": 35,
+    "attn_implementation": "eager",
+    "chunk_duration": 1.0,
+    "fps": 1.0,
+    "max_qa_tokens": 256,
+    "max_samples_per_split": null,
+    "max_samples_per_subset": null,
+    "seed": 42,
+    "excluded_backward_tasks": [
+      "HLD"
+    ],
+    "excluded_forward_tasks": [
+      "REC",
+      "SSR",
+      "CRR"
+    ],
+    "sampling_counts": {
+      "backward": {
+        "available": {
+          "EPM": 297,
+          "ASI": 148
+        },
+        "selected": {
+          "EPM": 297,
+          "ASI": 148
+        }
+      },
+      "realtime": {
+        "available": {
+          "OCR": 149,
+          "ACR": 109,
+          "ATR": 116,
+          "STU": 178,
+          "FPD": 101,
+          "OJR": 184
+        },
+        "selected": {
+          "OCR": 149,
+          "ACR": 109,
+          "ATR": 116,
+          "STU": 178,
+          "FPD": 101,
+          "OJR": 184
+        }
+      }
+    }
+  },
+  "splits": {
+    "backward": {
+      "title": "Backward Tracing",
+      "subset_accuracy_list": [
+        {
+          "task": "EPM",
+          "correct": 160,
+          "total": 297,
+          "accuracy": 53.872053872053876
+        },
+        {
+          "task": "ASI",
+          "correct": 88,
+          "total": 148,
+          "accuracy": 59.45945945945946
+        }
+      ],
+      "subsets": {
+        "EPM": {
+          "task": "EPM",
+          "correct": 160,
+          "total": 297,
+          "accuracy": 53.872053872053876
+        },
+        "ASI": {
+          "task": "ASI",
+          "correct": 88,
+          "total": 148,
+          "accuracy": 59.45945945945946
+        }
+      },
+      "official_split_avg": 56.66575666575667,
+      "pooled_accuracy": 55.73033707865169,
+      "correct": 248,
+      "total": 445
+    },
+    "realtime": {
+      "title": "Real-time Perception",
+      "subset_accuracy_list": [
+        {
+          "task": "OCR",
+          "correct": 123,
+          "total": 149,
+          "accuracy": 82.5503355704698
+        },
+        {
+          "task": "ACR",
+          "correct": 77,
+          "total": 109,
+          "accuracy": 70.64220183486239
+        },
+        {
+          "task": "ATR",
+          "correct": 91,
+          "total": 116,
+          "accuracy": 78.44827586206897
+        },
+        {
+          "task": "STU",
+          "correct": 120,
+          "total": 178,
+          "accuracy": 67.41573033707866
+        },
+        {
+          "task": "FPD",
+          "correct": 76,
+          "total": 101,
+          "accuracy": 75.24752475247524
+        },
+        {
+          "task": "OJR",
+          "correct": 140,
+          "total": 184,
+          "accuracy": 76.08695652173913
+        }
+      ],
+      "subsets": {
+        "OCR": {
+          "task": "OCR",
+          "correct": 123,
+          "total": 149,
+          "accuracy": 82.5503355704698
+        },
+        "ACR": {
+          "task": "ACR",
+          "correct": 77,
+          "total": 109,
+          "accuracy": 70.64220183486239
+        },
+        "ATR": {
+          "task": "ATR",
+          "correct": 91,
+          "total": 116,
+          "accuracy": 78.44827586206897
+        },
+        "STU": {
+          "task": "STU",
+          "correct": 120,
+          "total": 178,
+          "accuracy": 67.41573033707866
+        },
+        "FPD": {
+          "task": "FPD",
+          "correct": 76,
+          "total": 101,
+          "accuracy": 75.24752475247524
+        },
+        "OJR": {
+          "task": "OJR",
+          "correct": 140,
+          "total": 184,
+          "accuracy": 76.08695652173913
+        }
+      },
+      "official_split_avg": 75.06517081311569,
+      "pooled_accuracy": 74.91039426523298,
+      "correct": 627,
+      "total": 837
+    }
+  },
+  "overall": {
+    "official_total_avg": 65.86546373943618,
+    "pooled_overall_accuracy": 68.25273010920436,
+    "correct": 875,
+    "total": 1282
+  }
+}
