@@ -6,6 +6,8 @@ __pycache__/
 # Local datasets and generated artifacts
 data/
 # results/
+results/**/*.jsonl
+results/**/*.json
 # main_experiments/results/
 efficiency/result/
 efficiency/video/
@@ -20,3 +22,5 @@ offload/
 *.mp4
 *.mov
 *.avi
+
+*.pt

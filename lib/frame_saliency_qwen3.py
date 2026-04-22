@@ -504,6 +504,40 @@ def flatten_chunks(
     return frames, frame_rows, recent_indices, recent_chunk_ids
 
 
+def positive_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return int_value if int_value > 0 else None
+
+
+def resolve_value_projection_shape(self_attn: Any) -> tuple[int | None, int | None]:
+    if self_attn is None:
+        return None, None
+
+    config = getattr(self_attn, "config", None)
+    head_dim = positive_int_or_none(getattr(self_attn, "head_dim", None))
+    if head_dim is None and config is not None:
+        head_dim = positive_int_or_none(getattr(config, "head_dim", None))
+
+    num_kv_heads = positive_int_or_none(getattr(self_attn, "num_key_value_heads", None))
+    if num_kv_heads is None and config is not None:
+        num_kv_heads = positive_int_or_none(getattr(config, "num_key_value_heads", None))
+
+    v_proj = getattr(self_attn, "v_proj", None)
+    out_features = positive_int_or_none(getattr(v_proj, "out_features", None))
+    if out_features is not None:
+        if head_dim is not None and num_kv_heads is None and out_features % head_dim == 0:
+            num_kv_heads = out_features // head_dim
+        elif num_kv_heads is not None and head_dim is None and out_features % num_kv_heads == 0:
+            head_dim = out_features // num_kv_heads
+
+    return head_dim, num_kv_heads
+
+
 @dataclass
 class LayerwiseFrameAttentionCollector:
     frame_token_spans: list[tuple[int, int]]
@@ -521,8 +555,9 @@ class LayerwiseFrameAttentionCollector:
         self.layer_raw_attentions: dict[int, torch.Tensor] = {}
         self.map_layer_index_set = set(int(index) for index in (self.map_layer_indices or []))
         self.layer_attention_maps: dict[int, dict[str, torch.Tensor]] = {}
-        # Per-display-layer per-frame per-patch attention vectors and per-frame V-norms.
+        # Per-display-layer per-frame per-patch attention vectors and V-norms.
         self.layer_per_patch_attention: dict[int, list[torch.Tensor]] = {}
+        self.layer_per_patch_value_norms: dict[int, list[torch.Tensor]] = {}
         self.layer_value_norms: dict[int, torch.Tensor] = {}
 
     def make_hook(self, layer_idx: int):
@@ -594,9 +629,25 @@ class LayerwiseFrameAttentionCollector:
             reshaped = value_tensor.float().view(1, seq_len, int(num_kv_heads), int(head_dim))
             # L2 norm per head over head_dim, mean across heads -> [seq_len].
             per_token_norm = reshaped.norm(dim=-1).mean(dim=-1).squeeze(0)
-            per_frame_means = []
+
+            per_frame_norms: list[torch.Tensor] = []
             for start, end in self.frame_token_spans:
-                per_frame_means.append(per_token_norm[start:end].mean())
+                per_frame_norms.append(per_token_norm[start:end].detach().cpu())
+            if self.capture_per_patch and layer_idx in self.map_layer_index_set:
+                self.layer_per_patch_value_norms[layer_idx] = per_frame_norms
+
+            metadata = self.question_prefill_map_metadata
+            if metadata is not None:
+                self.layer_value_norms[layer_idx] = (
+                    per_token_norm[
+                        int(metadata.frame_token_start) : int(metadata.frame_token_end)
+                    ]
+                    .detach()
+                    .cpu()
+                )
+                return
+
+            per_frame_means = [frame_norms.mean() for frame_norms in per_frame_norms]
             self.layer_value_norms[layer_idx] = torch.stack(per_frame_means, dim=0).detach().cpu()
 
         return hook
@@ -630,6 +681,8 @@ class LayerwiseFrameAttentionCollector:
             "display_layer_indices": [int(index) for index in display_layer_indices],
             "attention_frame_indices": [int(index) for index in metadata.attention_frame_indices],
             "frame_bin_slices": [[int(start), int(end)] for start, end in metadata.frame_bin_slices],
+            "frame_local_bin_spans": [[int(start), int(end)] for start, end in metadata.frame_local_bin_spans],
+            "frame_token_range": [int(metadata.frame_token_start), int(metadata.frame_token_end)],
             "frame_bin_labels": list(metadata.frame_bin_labels),
             "question_bin_labels": list(metadata.question_bin_labels),
         }
@@ -655,28 +708,29 @@ class LayerwiseFrameAttentionCollector:
         if stacked_question_frame_maps.ndim != 3 or stacked_question_frame_maps.shape[-1] < 1:
             return None
 
-        frame_scores = []
-        for start, end in metadata.frame_bin_slices:
-            start = int(start)
-            end = int(end)
-            if end <= start:
-                continue
-            frame_scores.append(stacked_question_frame_maps[:, :, start:end].float().mean())
-        if not frame_scores:
+        num_frame_bins = int(stacked_question_frame_maps.shape[-1])
+        if num_frame_bins < 1 or len(metadata.frame_local_bin_spans) != num_frame_bins:
             return None
-        sink_bin_scores = torch.stack(frame_scores, dim=0)
+        sink_bin_scores = stacked_question_frame_maps.float().mean(dim=(0, 1))
         sink_bin_index = int(torch.argmax(sink_bin_scores).item())
-        if sink_bin_index < 0 or sink_bin_index >= len(metadata.frame_bin_slices):
+        if sink_bin_index < 0 or sink_bin_index >= num_frame_bins:
             return None
 
-        sink_frame_bin_start, sink_frame_bin_end = metadata.frame_bin_slices[sink_bin_index]
-        sink_frame_bin_start = int(sink_frame_bin_start)
-        sink_frame_bin_end = int(sink_frame_bin_end)
-        if sink_frame_bin_end <= sink_frame_bin_start:
+        sink_frame_local_index: int | None = None
+        sink_frame_bin_start: int | None = None
+        sink_frame_bin_end: int | None = None
+        for frame_local_index, (frame_bin_start, frame_bin_end) in enumerate(metadata.frame_bin_slices):
+            frame_bin_start = int(frame_bin_start)
+            frame_bin_end = int(frame_bin_end)
+            if frame_bin_start <= sink_bin_index < frame_bin_end:
+                sink_frame_local_index = int(frame_local_index)
+                sink_frame_bin_start = frame_bin_start
+                sink_frame_bin_end = frame_bin_end
+                break
+        if sink_frame_local_index is None or sink_frame_bin_start is None or sink_frame_bin_end is None:
             return None
 
-        sink_token_start = int(metadata.frame_local_bin_spans[sink_frame_bin_start][0])
-        sink_token_end = int(metadata.frame_local_bin_spans[sink_frame_bin_end - 1][1])
+        sink_token_start, sink_token_end = metadata.frame_local_bin_spans[sink_bin_index]
         sink_token_start = int(sink_token_start)
         sink_token_end = int(sink_token_end)
         if sink_token_end <= sink_token_start:
@@ -685,13 +739,13 @@ class LayerwiseFrameAttentionCollector:
         stacked_token_maps = torch.stack(question_frame_token_maps, dim=0)
         sink_token_maps = stacked_token_maps[:, :, sink_token_start:sink_token_end].contiguous()
         sink_frame_label = (
-            metadata.frame_bin_labels[sink_bin_index]
-            if sink_bin_index < len(metadata.frame_bin_labels)
+            metadata.frame_bin_labels[sink_frame_local_index]
+            if sink_frame_local_index < len(metadata.frame_bin_labels)
             else ""
         )
         sink_frame_index = (
-            metadata.attention_frame_indices[sink_bin_index]
-            if sink_bin_index < len(metadata.attention_frame_indices)
+            metadata.attention_frame_indices[sink_frame_local_index]
+            if sink_frame_local_index < len(metadata.attention_frame_indices)
             else None
         )
         sink_token_count = sink_token_end - sink_token_start
@@ -704,15 +758,17 @@ class LayerwiseFrameAttentionCollector:
             "sink_bin_score": float(sink_bin_scores[sink_bin_index].item()),
             "sink_frame_label": str(sink_frame_label),
             "sink_frame_index": int(sink_frame_index) if sink_frame_index is not None else None,
-            "sink_frame_local_index": sink_bin_index,
-            "sink_frame_bin_start": sink_frame_bin_start,
-            "sink_frame_bin_end": sink_frame_bin_end,
+            "sink_frame_local_index": int(sink_frame_local_index),
+            "sink_frame_bin_start": int(sink_frame_bin_start),
+            "sink_frame_bin_end": int(sink_frame_bin_end),
+            "sink_bin_start": sink_bin_index,
+            "sink_bin_end": sink_bin_index + 1,
             "sink_token_start": sink_token_start,
             "sink_token_end": sink_token_end,
             "sink_global_token_start": int(metadata.frame_token_start + sink_token_start),
             "sink_global_token_end": int(metadata.frame_token_start + sink_token_end),
             "token_labels": [f"tok{index}" for index in range(sink_token_count)],
-            "selection_rule": "sample_common_max_question_frame_mean",
+            "selection_rule": "sample_common_max_question_frame_bin_mean",
         }
 
 
@@ -1249,8 +1305,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                 value_head_dim, value_num_kv_heads = (None, None)
                 if save_example_matrices and text_layers:
                     sample_attn = getattr(text_layers[0], "self_attn", None)
-                    value_head_dim = getattr(sample_attn, "head_dim", None)
-                    value_num_kv_heads = getattr(sample_attn, "num_key_value_heads", None)
+                    value_head_dim, value_num_kv_heads = resolve_value_projection_shape(sample_attn)
                 prefill_collector = LayerwiseFrameAttentionCollector(
                     frame_token_spans=question_only_inputs["frame_token_spans"],
                     query_positions=question_only_inputs["question_token_positions"],
@@ -1331,6 +1386,22 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                     if per_patch_payload:
                         example_payload["question_prefill_per_patch_attention"] = per_patch_payload
 
+                    per_patch_value_norm_payload: dict[int, list[torch.Tensor]] = {}
+                    for layer_idx in display_layer_indices:
+                        per_frame_norms = prefill_collector.layer_per_patch_value_norms.get(int(layer_idx))
+                        if per_frame_norms is None or len(per_frame_norms) != len(patch_grids):
+                            continue
+                        reshaped_norms: list[torch.Tensor] = []
+                        for vector, (patch_h, patch_w) in zip(per_frame_norms, patch_grids):
+                            expected = patch_h * patch_w
+                            if vector.numel() != expected:
+                                reshaped_norms.append(vector.detach().cpu())
+                                continue
+                            reshaped_norms.append(vector.detach().cpu().reshape(patch_h, patch_w))
+                        per_patch_value_norm_payload[int(layer_idx)] = reshaped_norms
+                    if per_patch_value_norm_payload:
+                        example_payload["question_prefill_per_patch_value_norms"] = per_patch_value_norm_payload
+
                     value_norm_rows: list[torch.Tensor] = []
                     have_value_norms = True
                     for layer_idx in display_layer_indices:
@@ -1341,6 +1412,7 @@ class Qwen3Recent4FrameSaliencyAnalyzer(_BaseQwen3RecentWindowQAModel):
                         value_norm_rows.append(row)
                     if have_value_norms and value_norm_rows:
                         example_payload["question_prefill_value_norms"] = torch.stack(value_norm_rows, dim=0)
+                        example_payload["question_prefill_value_norm_unit"] = "frame_patch_token"
                 if save_raw_attentions:
                     display_layer_indices = metrics["question_prefill_attention"]["display_layer_indices"]
                     example_payload["raw_question_prefill_attentions"] = {

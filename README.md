@@ -169,18 +169,20 @@ python scoring/score_ovo_bench.py \
 
 - qwen3-vl-8B reproducing: ovo_qwen3vl_recent4
 - test1-1 (SigLIP cosine similarity mean percentile, use only 12 frames including recent 4 frames): ovo_qwen3vl_siglip_subset20_20260415_151005
-- test1-1 (SigLIP cosine similarity mean percentile, all decoded frames cap 768): ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820
-- test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attention_subset20_20260416_192329
+- test1-1 (SigLIP cosine similarity mean percentile, all decoded frames cap 128): ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820
+- test1-2 (layer-wise attention score mean percentile, attention heatmap): ovo_qwen3vl_attn_top4_layer35_20260418_123542
 - test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames): ovo_qwen3vl_siglip_top4_all_20260415_205218_uniform
 - test2 (SigLIP top-4 frame inference from uniformly sampled 12 frames including recent 4 frames): ovo_qwen3vl_siglip_top4_all_20260416_141554_always_recent4
-- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 768): -
-- test3 (attention score based selection, layer 0):
-- test3 (attention score based selection, layer 18):
-- test3 (attention score based selection, layer 32):
-- test3 (attention score based selection, layer 35):
-- test4 (Visual-RAG: SigLIP top-4 non-recent frames + recent 4 frames, qwen cap 768): ovo_qwen3vl_vrag_top4_20260417_170754_flash
-- test4 (Visual-RAG: SigLIP top- non-recent frames + recent 4 frames, qwen cap 768): ovo_qwen3vl_vrag_top8_20260417_170845_flash
-- test5 (V-RAG + Chunked attention: retrieved frames split by `chunk_size`, recent frames = 1 chunk, cross-chunk attention blocked in every layer): -
+- test2 (SigLIP top-4 frame inference from all decoded frames, qwen cap 128): ovo_qwen3vl_siglip_top4_all_decoded_cap128_20260418_123542
+- test3 (attention score based selection, layer 0): ovo_qwen3vl_attn_top4_layer0_20260418_123542
+- test3 (attention score based selection, layer 32): ovo_qwen3vl_attn_top4_layer32_20260418_123542
+- test3 (attention score based selection, layer 35): ovo_qwen3vl_attn_top4_layer35_20260418_123542
+- test4 (Visual-RAG: SigLIP top-4 non-recent frames + recent 4 frames, qwen cap 128): ovo_qwen3vl_vrag_top4_20260417_170754_flash
+- test4 (Visual-RAG: SigLIP top- non-recent frames + recent 4 frames, qwen cap 128): ovo_qwen3vl_vrag_top8_20260417_170845_flash
+- test5 (V-RAG + Chunked attention: retrieved frames split by `chunk_size`, recent frames = 1 chunk, cross-chunk attention blocked in every layer): ...
+- test6 (ReKV-style per-token layer-wise KV retrieval from 12 candidate frames, single-pass prefill, budget = 4 frames of vision tokens): -
+- test7 (test6 with `--shared_scoring_layer`: single layer's score drives the top-K indices shared across all layers): ovo_qwen3vl_test7_*
+- test8 (test6 with `--pre_retrieval_evict`: top-scoring tokens are evicted before top-K retrieval; combinable with test7): ovo_qwen3vl_test8_*
 
 </details>
 
@@ -232,7 +234,48 @@ produces `question_prefill_frame_frame_maps.png` and
 The pooled `plots/` directory additionally includes
 `question_prefill_frame_frame_maps_average.png` and
 `question_prefill_question_frame_maps_average.png`, averaged over the saved
-example subset only.
+example subset only. It also includes
+`question_prefill_attention_score_token_count_by_bin_average.png`, which
+averages saved examples into layer panels where the purple bars are
+question-bin-averaged attention scores per frame token bin. Frame token bins
+are drawn at uniform x-axis spacing, with faint vertical separators marking
+frame boundaries when all averaged examples share the same frame/bin axis, or
+when a majority frame/bin layout matches the averaged x-axis. It also writes
+`question_prefill_attention_score_token_count_by_norm_average.png`, where the
+x-axis is built by taking the min/max L2 norm across all plotted token-wise
+values from all display layers, splitting that range into uniform norm bins,
+and using that same x-axis scale for every layer panel. In the norm-bin plot,
+the yellow line is the average number of tokens in each norm bin and the purple
+bars are token-wise average attention scores in that bin. Both figures include
+a legend and are written twice, matching the attention heatmaps:
+the default filenames use p99.5-clipped y-axis scaling and companion
+`*_rawscale.png` files use the full raw min/max scale. The frame-bin plots
+(saved-example and saved-example-average; regular and rawscale) omit the
+token-count line and show only attention-score bars. For the norm-bin figures,
+the line uses the left y-axis and the bars use the right y-axis; y-limits are
+independently set from each subplot's plotted data so the visible range is
+optimized per layer. Each saved example gets the same bin/norm views at
+`plots/examples/<example>/question_prefill_attention_score_token_count_by_bin.png`
+and
+`plots/examples/<example>/question_prefill_attention_score_token_count_by_norm.png`.
+It also gets
+`plots/examples/<example>/question_prefill_attention_score_top20_token_value_norm.png`,
+where each layer panel selects the top-20 flattened frame-patch token numbers
+by token-wise attention score, sorts them from highest to lowest attention,
+draws the attention scores as purple bars on the right y-axis, and overlays the
+matching value norms as a teal line on the left y-axis. The pooled directory
+also includes
+`question_prefill_attention_score_top20_token_value_norm_pooled.png`; this
+figure first takes each saved example's per-layer top-20 tokens, pools those
+candidates across saved examples, then reselects the top-20 candidates per
+layer without averaging or collapsing duplicate token numbers. The top-20
+figures are also written with `*_rawscale.png` companions using the full raw
+y-axis ranges.
+The frame-bin plot requires `frame_local_bin_spans`; the norm-bin plot requires
+both `question_prefill_value_norms` and token-wise
+`question_prefill_per_patch_attention`. The top-20 token/value-norm plots use
+the same value-norm and token-wise attention payloads. Older example payloads
+without the required metadata are skipped with a message.
 Each saved example also produces 12 per-layer attention overlay figures
 (`question_prefill_attention_overlay_layer{N}.png`, one per display layer)
 where each panel shows an analysis frame in the background with that layer's
@@ -241,14 +284,18 @@ nearest-neighbor) drawn on top, aligned to the Qwen3-VL spatial-merged patch
 grid. A companion `question_prefill_value_norms.png` renders a 3×4 grid of
 12 layer panels of bar charts whose x-axis bins and tick labels mirror
 `question_prefill_frame_frame_maps.png`, with y = mean L2 norm of the V
-projection (per-token L2 norm averaged over key-value heads, then averaged
-within each frame bin); recent frames are highlighted in red. To support
-these renderings, the example payload now additionally stores
+projection after patch-level values are pooled into the displayed frame-axis
+bins; recent frames are highlighted in red and the selected attention sink bin
+is highlighted in green. To support these renderings, the example payload now
+additionally stores
 `analysis_frames` (per-frame uint8 RGB arrays for the analysis subset),
 `analysis_frame_indices`, `analysis_frame_patch_grids` (per-frame
 `(H′, W′)`), `question_prefill_per_patch_attention` (per display layer →
-list of `(H′, W′)` tensors), and `question_prefill_value_norms` (shape
-`[len(display_layers), num_analysis_frames]`). The plotter falls back to
+list of `(H′, W′)` tensors), `question_prefill_per_patch_value_norms` (per
+display layer → list of `(H′, W′)` tensors), and
+`question_prefill_value_norms` (shape
+`[len(display_layers), num_frame_patch_tokens]`, unit
+`frame_patch_token`). The plotter falls back to
 "skipping …" messages for older result directories that lack these keys.
 The SigLIP similarity test (test1-1) decodes the full video at `--fps 1.0`
 with the same `qwen_vl_utils` sampling policy used by Test 2, capped at
@@ -299,7 +346,7 @@ Generate plots later from a saved result directory.
 
 ```bash
 python analysis/plot_recent_frame_saliency.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset20_20260416_192329
+    --result-dir main_experiments/results/ovo_qwen3vl_attention_subset20_20260420_214752
 ```
 
 siglip similarity test.
@@ -329,7 +376,7 @@ Generate plots from a saved SigLIP similarity result directory.
 
 ```bash
 python analysis/plot_siglip_similarity.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_siglip_subset20_all_frames_20260417_114820
+    --result-dir main_experiments/results/ovo_qwen3vl_siglip_subset20_20260415_151005
 ```
 </details>
 
@@ -431,7 +478,7 @@ Run one layer manually:
 ```bash
 LAYER=0
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=5,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test3.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
@@ -723,57 +770,12 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py
     > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
 ```
 
-```bash
-# --max_samples_per_subset 50 \
-TOP_K=4
-CHUNK_SIZE=2
-DECODE_MAX_FRAMES=128
-RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
-    --analysis_scope full \
-    --recent_frames_only 4 \
-    --decode_max_frames "${DECODE_MAX_FRAMES}" \
-    --top_k_historical "${TOP_K}" \
-    --chunk_size "${CHUNK_SIZE}" \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    --siglip_model_name google/siglip-so400m-patch14-384 \
-    --siglip_device auto \
-    --save_example_matrices 0 \
-    --attn_implementation sdpa \
-    --model_device auto \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
-```
-
-```bash
-# --max_samples_per_subset 50 \
-TOP_K=4
-CHUNK_SIZE=1
-DECODE_MAX_FRAMES=128
-RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
-    --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --anno_path data/ovo_bench/ovo_bench_new.json \
-    --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
-    --analysis_scope full \
-    --recent_frames_only 4 \
-    --decode_max_frames "${DECODE_MAX_FRAMES}" \
-    --top_k_historical "${TOP_K}" \
-    --chunk_size "${CHUNK_SIZE}" \
-    --chunk_duration 1.0 \
-    --fps 1.0 \
-    --siglip_model_name google/siglip-so400m-patch14-384 \
-    --siglip_device auto \
-    --save_example_matrices 0 \
-    --attn_implementation sdpa \
-    --model_device auto \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
-```
+PCW-style per-chunk positional encoding variant. `--reset_chunk_position_ids`
+makes every chunk (retrieved + recent) receive mRoPE coordinates as if it
+were the only video input, sharing the same base position; question /
+assistant tokens shift to start right after the longest chunk's max
+position, and `rope_deltas` is recomputed so decode continues correctly.
+Default is off (standard whole-sequence mRoPE).
 
 ```bash
 # --max_samples_per_subset 50 \
@@ -785,7 +787,7 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_pcw_${RUN_TAG}" \
     --analysis_scope full \
     --recent_frames_only 4 \
     --decode_max_frames "${DECODE_MAX_FRAMES}" \
@@ -798,7 +800,8 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py
     --save_example_matrices 0 \
     --attn_implementation sdpa \
     --model_device auto \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+    --reset_chunk_position_ids \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_pcw_${RUN_TAG}.log" 2>&1 &
 ```
 
 ```bash
@@ -807,11 +810,11 @@ TOP_K=8
 CHUNK_SIZE=2
 DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test5.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}" \
+    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_pcw_${RUN_TAG}" \
     --analysis_scope full \
     --recent_frames_only 4 \
     --decode_max_frames "${DECODE_MAX_FRAMES}" \
@@ -824,43 +827,375 @@ CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test5.py
     --save_example_matrices 0 \
     --attn_implementation sdpa \
     --model_device auto \
-    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}.log" 2>&1 &
+    --reset_chunk_position_ids \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_pcw_${RUN_TAG}.log" 2>&1 &
 ```
 
-Smoke run (1 sample per split). Because Test 5 uses arbitrary 4D masks,
-`flash_attention_2` is disabled for the text decoder; use 4 GPUs with
-`--model_device auto` for the 8B model on 24GB cards.
+
+</details>
+
+<details>
+<summary><b>Test 6</b></summary>
+
+Runs OVO-Bench backward/realtime evaluation with **single-pass layer-wise per-token KV retrieval**, inspired by ReKV (ICLR 2025)'s internal retrieval applied at token (not frame) granularity. Unlike Test 3, which prefills twice per sample (once to score, once to generate), Test 6 prefills the full 12-frame candidate pool **once** and captures per-layer question→vision scores. For each decoder layer independently, the top vision tokens are kept and the rest are dropped from that layer's KV cache. The retained KVs are then reused throughout decoding (no re-retrieval per step).
+
+The token budget equals `4 × per_frame_vision_tokens`, computed from the first sample's `grid_thw` via the model's `spatial_merge_size` and cached for the run. This matches the information budget of Test 3's top-4-frame selection but distributes it at token granularity and differently across layers.
+
+Scoring runs on raw `Q·Kᵀ · (1/√d)` averaged over heads and question tokens (softmax is row-monotone, so top-K ranking is preserved) — **no post-softmax attention matrix is ever materialised**, so `--attn_implementation flash_attention_2` (default) works. Q is captured via a `forward_pre_hook` on each text-layer `self_attn`; K is read from the populated KV cache (post-RoPE) or recomputed from hidden states (pre-RoPE). `--layer_number` is not used — all layers participate. The candidate pool is built with the same `uniform_with_recent_anchor` policy as Tests 1/2/3 (`--max_analysis_frames 12 --recent_frames_only 4` → recent 4 + uniform 8). The HLD backward-tracing subset is excluded.
+
+Two orthogonal knobs:
+
+- `--retrieval_rope_mode {post_rope, pre_rope}` (default `post_rope`): whether RoPE is applied to Q and K **before** the retrieval Q·Kᵀ score. `post_rope` reuses the post-RoPE K already in the cache (semantically closest to the legacy eager-attention signal); `pre_rope` projects pre-RoPE Q/K inside the hook (content-only similarity, matching ReKV §3).
+- `--decode_pe_mode {original, reindex}` (default `original`): position layout used for decoding after compression. `original` keeps each retained token's real M-RoPE position. `reindex` re-rotates every retained K (un-rotate at its original position via negated sin, then re-rotate at its new text-style position) so the compressed cache looks position-wise identical to a hypothetical prompt containing only the retained tokens at positions `0..N-1`; decode continues from position `N`. Reindex spans **all** retained tokens — system prompt + question tokens + top-K vision tokens (all entries of `non_vision_positions ∪ top-K`), so no one is left at an original position while others are reindexed.
+
+Outputs are saved under `results_incremental.jsonl`, `summary.json`, and `qwen3vl_attn_token_retrieval_results_*.json`. Each record reports `per_frame_vision_tokens`, `vision_token_budget`, `layer_top_vision_global_indices`, `retrieval_rope_mode`, and `decode_pe_mode`. `summary.json` reports subset/task accuracy, split-level official averages and pooled accuracy, plus `Official Total Avg.` and `Pooled Overall Acc.` for the full run.
+
+The commands below derive `EXP_TAG` from `RETRIEVAL_ROPE_MODE` and `DECODE_PE_MODE`, then include it in both result directories and log filenames so mode variants are easy to compare.
+
+Default full run (`flash_attention_2` + `post_rope` + `original`):
 
 ```bash
-TOP_K=4
-CHUNK_SIZE=2
-DECODE_MAX_FRAMES=128
 RUN_TAG=$(date +%Y%m%d_%H%M%S)
-CUDA_VISIBLE_DEVICES=4,5 python main_experiments/eval_qwen3vl_ovo_test5.py \
+RETRIEVAL_ROPE_MODE=post_rope
+DECODE_PE_MODE=original
+EXP_TAG="${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}"
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
     --model_path Qwen/Qwen3-VL-8B-Instruct \
-    --analysis_scope smoke \
     --anno_path data/ovo_bench/ovo_bench_new.json \
     --chunked_dir data/ovo_bench/chunked_videos \
-    --max_samples_per_split 1 \
-    --result_dir "main_experiments/results/ovo_qwen3vl_vrag_top${TOP_K}_chunk${CHUNK_SIZE}_${RUN_TAG}_smoke" \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}" \
     --recent_frames_only 4 \
-    --decode_max_frames "${DECODE_MAX_FRAMES}" \
-    --top_k_historical "${TOP_K}" \
-    --chunk_size "${CHUNK_SIZE}" \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
     --chunk_duration 1.0 \
     --fps 1.0 \
-    --siglip_device auto \
-    --save_example_matrices 0 \
-    --attn_implementation sdpa \
-    --model_device auto
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
 ```
 
-Render per-example attention heatmaps (reusing the Test 4 plotter):
+Smoke run (1 sample per split):
 
 ```bash
-python analysis/plot_vrag_attention_heatmap.py \
-    --result-dir main_experiments/results/ovo_qwen3vl_vrag_top4_chunk2_20260417_200000
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+EXP_TAG="${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}_smoke"
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --analysis_scope smoke \
+    --max_samples_per_split 1 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
 ```
+
+**Pre-RoPE retrieval + reindex decode** (fully position-agnostic pipeline):
+
+```bash
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+EXP_TAG="${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}"
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Pre-RoPE retrieval + original position decode (content-only Q·Kᵀ, ReKV §3-style):
+
+```bash
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=original
+EXP_TAG="${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}"
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Post-RoPE retrieval + reindex decode (compressed cache looks like a fresh contiguous sequence at positions 0..N-1):
+
+```bash
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RETRIEVAL_ROPE_MODE=post_rope
+DECODE_PE_MODE=reindex
+EXP_TAG="${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}"
+CUDA_VISIBLE_DEVICES=4,5,6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test6_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+</details>
+
+<details>
+<summary><b>Test 7</b></summary>
+
+Extends Test 6 with a single knob: `--shared_scoring_layer <LAYER>`. Instead
+of each decoder layer independently picking its own top-K vision tokens from
+its own Q·Kᵀ scores, the specified layer's score is computed once and the
+resulting top-K indices are applied uniformly to **every layer's** KV cache.
+The token budget is unchanged (`4 × per_frame_vision_tokens`). Omit the flag
+to fall back to Test 6's per-layer independent selection. All other Test 6
+knobs (`--retrieval_rope_mode`, `--decode_pe_mode`, `--attn_implementation`)
+continue to apply and are orthogonal.
+
+Each saved record adds `shared_scoring_layer`, `evict_spec_raw`, and
+`evict_count_absolute`. With `--shared_scoring_layer` set, every entry of
+`layer_top_vision_global_indices` is identical.
+
+Single-layer shared run (default `post_rope` + `original`, candidate layers
+e.g. 0, 18, 32, 35):
+
+```bash
+LAYER=32
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+EXP_TAG="sharedL${LAYER}_${RETRIEVAL_ROPE_MODE}_${DECODE_PE_MODE}"
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test7_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --shared_scoring_layer "${LAYER}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test7_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Smoke run (1 sample per split):
+
+```bash
+LAYER=32
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="sharedL${LAYER}_smoke"
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test7_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --shared_scoring_layer "${LAYER}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --analysis_scope smoke \
+    --max_samples_per_split 1 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test7_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+</details>
+
+<details>
+<summary><b>Test 8</b></summary>
+
+Extends Test 6 with a pre-retrieval eviction step controlled by
+`--pre_retrieval_evict`. Immediately before the top-K selection, the
+highest-scoring vision tokens are dropped from consideration so that the
+retained top-K is drawn from the **remaining** candidate pool. The flag
+accepts either an absolute integer count (`--pre_retrieval_evict 32`) or a
+percentage of the candidate vision tokens written with a trailing `%`
+(`--pre_retrieval_evict 10%`). Omit the flag to disable eviction.
+
+Eviction composes with every Test 6 mode and with Test 7's
+`--shared_scoring_layer`:
+
+- **Test 6 default (per-layer) + eviction**: each layer evicts its own
+  top-scoring tokens from its own score, then selects top-K from what remains.
+- **Test 7 (shared layer) + eviction**: eviction and top-K both use the one
+  shared layer's score.
+
+The token budget remains `4 × per_frame_vision_tokens`, but is clamped down
+to `num_vision_tokens - evict_count` when eviction would otherwise leave
+fewer than `budget` tokens. Each saved record includes `evict_spec_raw`
+(the original CLI string, e.g. `"10%"`) and `evict_count_absolute` (the
+per-sample resolved integer), plus `evict_layer_range` when range-limited
+eviction is enabled.
+
+Use `--evict_layer_range START-END` to apply eviction only to an inclusive
+decoder-layer range, e.g. `--evict_layer_range 20-34`. Layers outside the
+range still select top-K tokens without pre-eviction. This range-limited
+eviction mode is incompatible with `--shared_scoring_layer`.
+
+Absolute count:
+
+```bash
+EVICT=32
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="evict${EVICT}"
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --pre_retrieval_evict "${EVICT}" \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Percentage of the candidate pool:
+
+```bash
+EVICT=10%
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="evict${EVICT/\%/pct}"
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --pre_retrieval_evict "${EVICT}" \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+**Layer-range eviction (layers 20 through 34 only)**:
+
+```bash
+EVICT=3
+EVICT_LAYER_RANGE=20-34
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="layerwise_evict${EVICT}_layers${EVICT_LAYER_RANGE/-/to}"
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+CUDA_VISIBLE_DEVICES=4,5 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --pre_retrieval_evict "${EVICT}" \
+    --evict_layer_range "${EVICT_LAYER_RANGE}" \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Combined with Test 7 (shared layer drives both eviction and top-K):
+
+```bash
+EVICT=3
+LAYER=32
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="sharedL${LAYER}_evict${EVICT}"
+RETRIEVAL_ROPE_MODE=pre_rope
+DECODE_PE_MODE=reindex
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --shared_scoring_layer "${LAYER}" \
+    --pre_retrieval_evict "${EVICT}" \
+    --retrieval_rope_mode "${RETRIEVAL_ROPE_MODE}" \
+    --decode_pe_mode "${DECODE_PE_MODE}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
+Smoke run (1 sample per split):
+
+```bash
+EVICT=32
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+EXP_TAG="evict${EVICT}_smoke"
+CUDA_VISIBLE_DEVICES=6,7 nohup python main_experiments/eval_qwen3vl_ovo_test6.py \
+    --model_path Qwen/Qwen3-VL-8B-Instruct \
+    --anno_path data/ovo_bench/ovo_bench_new.json \
+    --chunked_dir data/ovo_bench/chunked_videos \
+    --result_dir "main_experiments/results/ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}" \
+    --recent_frames_only 4 \
+    --max_analysis_frames 12 \
+    --attn_implementation flash_attention_2 \
+    --pre_retrieval_evict "${EVICT}" \
+    --model_device auto \
+    --chunk_duration 1.0 \
+    --fps 1.0 \
+    --analysis_scope smoke \
+    --max_samples_per_split 1 \
+    > "./main_experiments/results/nohup_ovo_qwen3vl_test8_${EXP_TAG}_${RUN_TAG}.log" 2>&1 &
+```
+
 </details>
 
 ## 📢 Citation

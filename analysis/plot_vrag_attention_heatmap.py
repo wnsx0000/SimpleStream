@@ -23,6 +23,7 @@ from analysis.plot_recent_frame_saliency import (
     ensure_dir,
     make_example_label,
     question_prefill_map_payload,
+    rawscale_output_path,
     render_question_prefill_map_panels,
     to_numpy_array,
 )
@@ -58,10 +59,11 @@ def plot_example_heatmaps(example_path: Path, plots_dir: Path) -> bool:
 
     frame_frame_maps = to_numpy_array(map_payload.get("frame_frame_maps"))
     if frame_frame_maps is not None:
+        frame_frame_path = example_dir / "question_prefill_frame_frame_maps.png"
         render_question_prefill_map_panels(
             frame_frame_maps,
             display_layer_indices,
-            example_dir / "question_prefill_frame_frame_maps.png",
+            frame_frame_path,
             figure_title=f"Question Prefill Frame\u2194Frame Maps: {example_label}",
             x_label="Frame Index",
             y_label="Frame Index",
@@ -69,14 +71,27 @@ def plot_example_heatmaps(example_path: Path, plots_dir: Path) -> bool:
             frame_bin_slices=frame_bin_slices,
             frame_bin_labels=frame_bin_labels,
         )
+        render_question_prefill_map_panels(
+            frame_frame_maps,
+            display_layer_indices,
+            rawscale_output_path(frame_frame_path),
+            figure_title=f"Question Prefill Frame\u2194Frame Maps: {example_label}",
+            x_label="Frame Index",
+            y_label="Frame Index",
+            mode="frame_frame",
+            frame_bin_slices=frame_bin_slices,
+            frame_bin_labels=frame_bin_labels,
+            robust_percentile=None,
+        )
         rendered_any = True
 
     question_frame_maps = to_numpy_array(map_payload.get("question_frame_maps"))
     if question_frame_maps is not None:
+        question_frame_path = example_dir / "question_prefill_question_frame_maps.png"
         render_question_prefill_map_panels(
             question_frame_maps,
             display_layer_indices,
-            example_dir / "question_prefill_question_frame_maps.png",
+            question_frame_path,
             figure_title=f"Question Prefill Question\u2192Frame Maps: {example_label}",
             x_label="Frame Index",
             y_label="Question Token Bin",
@@ -84,6 +99,19 @@ def plot_example_heatmaps(example_path: Path, plots_dir: Path) -> bool:
             frame_bin_slices=frame_bin_slices,
             frame_bin_labels=frame_bin_labels,
             question_bin_labels=question_bin_labels,
+        )
+        render_question_prefill_map_panels(
+            question_frame_maps,
+            display_layer_indices,
+            rawscale_output_path(question_frame_path),
+            figure_title=f"Question Prefill Question\u2192Frame Maps: {example_label}",
+            x_label="Frame Index",
+            y_label="Question Token Bin",
+            mode="question_frame",
+            frame_bin_slices=frame_bin_slices,
+            frame_bin_labels=frame_bin_labels,
+            question_bin_labels=question_bin_labels,
+            robust_percentile=None,
         )
         rendered_any = True
 
